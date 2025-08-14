@@ -18,7 +18,6 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise ValueError("❌ BOT_TOKEN или WEBHOOK_URL не найдены в окружении!")
 
@@ -27,21 +26,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ====================== In-memory storage ======================
-requests_db = []       # список заявок
-user_roles = {}        # {user_id: "client"|"bank"}
-client_map = {}        # {request_id: user_id клиента}
-counter_offers = {}    # {request_id: counter_rate}
+# ====================== In-memory storage (MVP) ======================
+requests_db = []         # [{id, operation, currency1, currency2, amount, rate, client_name, status}]
+user_roles = {}          # {user_id: "client"|"bank"}
+client_map = {}          # {request_id: client_user_id}
+counter_offers = {}      # {request_id: counter_rate}
 
 # ====================== FSM ======================
 class RequestForm(StatesGroup):
-    operation = State()
-    currency1 = State()
-    currency2 = State()
-    amount = State()
-    rate = State()
-    client_name = State()
-    confirm = State()
+    client_name = State()   # 1) имя клиента (первый шаг)
+    operation = State()     # 2) операция
+    currency1 = State()     # 3) валюта покупки/продажи/первая (зависит от operation)
+    currency2 = State()     # 4) (только для Convert)
+    amount = State()        # 5) сумма
+    rate = State()          # 6) курс
+    confirm = State()       # 7) подтверждение
 
 class CounterForm(StatesGroup):
     new_rate = State()
@@ -85,7 +84,7 @@ client_menu = ReplyKeyboardMarkup(
 )
 
 # ====================== Helpers ======================
-def render_request(r):
+def render_request(r: dict) -> str:
     status_icon = "⏳" if r["status"] == "pending" else "✅" if r["status"] == "approved" else "❌" if r["status"] == "rejected" else "💬"
     return (
         f"📌 Заявка #{r['id']} | {status_icon} {r['status'].upper()}\n"
@@ -103,10 +102,20 @@ async def notify_client(req_id: int, text: str, buttons: InlineKeyboardMarkup | 
     except Exception as e:
         logging.warning("Failed to notify client %s for req %s: %s", user_id, req_id, e)
 
-# ====================== HANDLERS ======================
+# ====================== BASIC HANDLERS ======================
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
     await message.answer("👋 Привет! Выберите роль:", reply_markup=role_kb)
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    await message.answer(
+        "Доступные действия:\n"
+        "• /start — выбрать роль (Клиент/Банк)\n"
+        "• /rate — посмотреть mock‑курсы\n"
+        "• Клиент: «➕ Новая заявка»\n"
+        "• Банк: /list — список заявок"
+    )
 
 @dp.callback_query(F.data.startswith("role_"))
 async def set_role(callback: CallbackQuery):
@@ -118,27 +127,41 @@ async def set_role(callback: CallbackQuery):
         await callback.message.answer("✅ Роль установлена: Банк.\nИспользуйте /list для просмотра заявок.")
     await callback.answer()
 
-# -------- CLIENT FLOW --------
+# ====================== CLIENT FLOW ======================
 @dp.message(F.text == "➕ Новая заявка")
 async def new_request(message: Message, state: FSMContext):
     if user_roles.get(message.from_user.id) != "client":
-        return await message.answer("⛔ Только для клиентов.")
+        return await message.answer("⛔ Только для клиентов. Нажмите /start и выберите роль.")
+    # 1) ПЕРВЫЙ ВОПРОС — имя клиента
+    await message.answer("Введите имя клиента:")
+    await state.set_state(RequestForm.client_name)
+
+@dp.message(RequestForm.client_name)
+async def step_client_name(message: Message, state: FSMContext):
+    await state.update_data(client_name=message.text.strip())
+    # 2) операция
     await message.answer("Выберите операцию:", reply_markup=operation_kb)
     await state.set_state(RequestForm.operation)
 
 @dp.callback_query(RequestForm.operation)
-async def choose_operation(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(operation=callback.data)
-    await callback.message.answer("Выберите первую валюту:", reply_markup=currency_kb())
+async def step_operation(callback: CallbackQuery, state: FSMContext):
+    op = callback.data
+    await state.update_data(operation=op)
+    if op == "Sell":
+        await callback.message.answer("Введите валюту продажи:", reply_markup=currency_kb())
+    elif op == "Buy":
+        await callback.message.answer("Введите валюту покупки:", reply_markup=currency_kb())
+    else:  # Convert
+        await callback.message.answer("Выберите первую валюту:", reply_markup=currency_kb())
     await state.set_state(RequestForm.currency1)
     await callback.answer()
 
 @dp.callback_query(RequestForm.currency1)
-async def choose_currency1(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    operation = data["operation"]
+async def step_currency1(callback: CallbackQuery, state: FSMContext):
     await state.update_data(currency1=callback.data)
-    if operation == "Convert":
+    data = await state.get_data()
+    op = data["operation"]
+    if op == "Convert":
         await callback.message.answer("Выберите вторую валюту:", reply_markup=currency_kb())
         await state.set_state(RequestForm.currency2)
     else:
@@ -147,18 +170,18 @@ async def choose_currency1(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.callback_query(RequestForm.currency2)
-async def choose_currency2(callback: CallbackQuery, state: FSMContext):
+async def step_currency2(callback: CallbackQuery, state: FSMContext):
     await state.update_data(currency2=callback.data)
     await callback.message.answer("Введите сумму (например: 0.5 mio):")
     await state.set_state(RequestForm.amount)
     await callback.answer()
 
 @dp.message(RequestForm.amount)
-async def enter_amount(message: Message, state: FSMContext):
+async def step_amount(message: Message, state: FSMContext):
     amount = message.text.strip()
     await state.update_data(amount=amount)
 
-    # Рекомендованный курс
+    # Рекомендованный курс по паре
     rates = get_mock_rates()
     data = await state.get_data()
     cur1 = data["currency1"]
@@ -170,29 +193,24 @@ async def enter_amount(message: Message, state: FSMContext):
     await state.set_state(RequestForm.rate)
 
 @dp.message(RequestForm.rate)
-async def enter_rate(message: Message, state: FSMContext):
+async def step_rate(message: Message, state: FSMContext):
     try:
         rate = float(message.text.replace(",", "."))
     except ValueError:
         return await message.answer("❌ Неверный формат. Введите число.")
     await state.update_data(rate=rate)
-    await message.answer("Введите имя клиента:")
-    await state.set_state(RequestForm.client_name)
 
-@dp.message(RequestForm.client_name)
-async def enter_name(message: Message, state: FSMContext):
-    await state.update_data(client_name=message.text)
     data = await state.get_data()
     op, cur1, cur2 = data["operation"], data["currency1"], data.get("currency2", "UAH")
-    amount, rate, client = data["amount"], data["rate"], data["client_name"]
+    amount, client = data["amount"], data["client_name"]
 
     text = (
         "🔍 Подтвердите заявку:\n"
+        f"• Клиент: {client}\n"
         f"• Операция: {op}\n"
         f"• Валюта: {cur1}/{cur2}\n"
         f"• Сумма: {amount}\n"
         f"• Курс: {rate}\n"
-        f"• Клиент: {client}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm")],
@@ -202,15 +220,17 @@ async def enter_name(message: Message, state: FSMContext):
     await state.set_state(RequestForm.confirm)
 
 @dp.callback_query(RequestForm.confirm)
-async def confirm_request(callback: CallbackQuery, state: FSMContext):
+async def step_confirm(callback: CallbackQuery, state: FSMContext):
     if callback.data == "confirm":
         data = await state.get_data()
         req_id = len(requests_db) + 1
+        # Для Buy/Sell вторая валюта по умолчанию UAH
+        currency2 = data.get("currency2", "UAH")
         requests_db.append({
             "id": req_id,
             "operation": data["operation"],
             "currency1": data["currency1"],
-            "currency2": data.get("currency2", "UAH"),
+            "currency2": currency2,
             "amount": data["amount"],
             "rate": data["rate"],
             "client_name": data["client_name"],
@@ -223,7 +243,7 @@ async def confirm_request(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-# -------- /rate --------
+# ====================== /rate ======================
 @dp.message(F.text == "📊 Курс (/rate)")
 @dp.message(Command("rate"))
 async def show_rates(message: Message):
@@ -231,11 +251,11 @@ async def show_rates(message: Message):
     text = "\n".join([f"• {k}: {v}" for k, v in rates.items()])
     await message.answer(f"📊 *Текущие курсы:*\n{text}", parse_mode="Markdown")
 
-# -------- BANK FLOW --------
+# ====================== BANK FLOW ======================
 @dp.message(Command("list"))
 async def list_requests(message: Message):
     if user_roles.get(message.from_user.id) != "bank":
-        return await message.answer("⛔ Только для банка.")
+        return await message.answer("⛔ Только для банка. Нажмите /start и выберите роль.")
     if not requests_db:
         return await message.answer("📭 Нет заявок.")
     for r in requests_db:
@@ -248,8 +268,8 @@ async def list_requests(message: Message):
 
 @dp.callback_query(F.data.startswith(("approve_", "reject_", "counter_")))
 async def bank_actions(callback: CallbackQuery, state: FSMContext):
-    action, req_id = callback.data.split("_", 1)
-    req_id = int(req_id)
+    action, req_id_str = callback.data.split("_", 1)
+    req_id = int(req_id_str)
     for r in requests_db:
         if r["id"] == req_id:
             if action == "approve":
@@ -294,6 +314,7 @@ async def handle_client_counter_response(callback: CallbackQuery, state: FSMCont
     for r in requests_db:
         if r["id"] == req_id:
             if action == "accept":
+                # применяем курс банка
                 if req_id in counter_offers:
                     r["rate"] = counter_offers[req_id]
                 r["status"] = "pending"
@@ -320,10 +341,14 @@ async def update_client_rate(message: Message, state: FSMContext):
             await message.answer(f"✏ Новый курс {new_rate} отправлен банку по заявке #{req_id}.")
     await state.clear()
 
+# ====================== FALLBACK ======================
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Не понял 🤔\nОтправьте /start и выберите роль, или /help.")
+
 # ====================== WEBHOOK SERVER ======================
 async def on_startup(app: web.Application):
     logging.info("Setting webhook to %s", WEBHOOK_URL)
-    # drop_pending_updates=True, чтобы не тянуть старые апдейты
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
 async def on_shutdown(app: web.Application):
@@ -333,7 +358,8 @@ async def on_shutdown(app: web.Application):
 async def handle(request: web.Request):
     try:
         data = await request.json()
-        update = types.Update.model_validate(data)  # надежный парсинг
+        logging.info("Incoming update keys: %s", list(data.keys()))
+        update = types.Update.model_validate(data)  # надёжный парсинг для aiogram 3
         await dp.feed_update(bot, update)
         return web.Response(text="ok")
     except Exception as e:
@@ -343,14 +369,16 @@ async def handle(request: web.Request):
 async def health(request: web.Request):
     return web.Response(text="ok")
 
+async def webhook_info(request: web.Request):
+    return web.Response(text="webhook endpoint (use POST)", content_type="text/plain")
+
 app = web.Application()
-# Healthcheck
-app.router.add_get("/", health)
-# Очень важно: путь ДОЛЖЕН совпадать с хвостом WEBHOOK_URL (/<BOT_TOKEN>)
-app.router.add_post(f"/{BOT_TOKEN}", handle)
+app.router.add_get("/", health)                     # healthcheck
+app.router.add_get(f"/{BOT_TOKEN}", webhook_info)   # опционально для удобной проверки
+app.router.add_post(f"/{BOT_TOKEN}", handle)        # сам вебхук
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
-    # Render предоставляет PORT в окружении
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
