@@ -1,6 +1,7 @@
 import os
 import random
 import logging
+import asyncio
 from typing import Optional
 
 from aiohttp import web
@@ -13,51 +14,74 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.filters import Command
-
-# ===== ENV & LOGGING =====
 from dotenv import load_dotenv
-load_dotenv()
 
+# ====================== ENV & LOGGING ======================
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-REDIS_URL: Optional[str] = os.getenv("REDIS_URL")  # rediss://... (Upstash) или redis://...
+REDIS_URL: Optional[str] = os.getenv("REDIS_URL")  # можно не задавать (тогда память)
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise ValueError("❌ BOT_TOKEN или WEBHOOK_URL не найдены в окружении!")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ===== Storage (Redis fallback -> Memory) =====
-from aiogram.fsm.storage.memory import MemoryStorage
+bot = Bot(token=BOT_TOKEN)
 
+# ====================== Storage: Redis (если доступен) -> Memory ======================
+from aiogram.fsm.storage.memory import MemoryStorage
 storage = None
+
 if REDIS_URL:
     try:
         import redis.asyncio as redis  # pip install redis
         from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
-        _pool = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-        storage = RedisStorage(_pool, key_builder=DefaultKeyBuilder(with_destiny=True))
-        logging.info("FSM storage: Redis enabled")
+
+        r = redis.from_url(
+            REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
+        )
+
+        async def _ping():
+            try:
+                await r.ping()
+                return True
+            except Exception as e:
+                logging.warning("Redis недоступен: %s — переключаюсь на память", e)
+                return False
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.run_until_complete(_ping()):
+            storage = RedisStorage(r, key_builder=DefaultKeyBuilder(with_destiny=True))
+            logging.info("FSM storage: Redis ENABLED")
+        else:
+            storage = MemoryStorage()
+            logging.info("FSM storage: MemoryStorage (fallback)")
     except Exception as e:
-        logging.warning("Redis init failed, fallback to MemoryStorage: %s", e)
-
-if storage is None:
-    from aiogram.fsm.storage.memory import MemoryStorage
+        logging.warning("Redis init error: %s — использую MemoryStorage", e)
+        storage = MemoryStorage()
+else:
     storage = MemoryStorage()
-    logging.info("FSM storage: MemoryStorage enabled")
+    logging.info("FSM storage: MemoryStorage (REDIS_URL не задан)")
 
-bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# ===== In-memory DB (MVP) =====
+# ====================== In-memory DB (для MVP) ======================
 requests_db = []         # [{id, operation, currency1, currency2, amount, rate, client_name, status}]
 user_roles = {}          # {user_id: "client"|"bank"}
 client_map = {}          # {request_id: client_user_id}
 counter_offers = {}      # {request_id: counter_rate}
 
-# ===== FSM =====
+# ====================== FSM ======================
 class RequestForm(StatesGroup):
-    client_name = State()   # 1) имя клиента
+    client_name = State()   # 1) имя клиента (первый шаг)
     operation = State()     # 2) операция
     currency1 = State()     # 3) валюта (покупки/продажи/первая)
     currency2 = State()     # 4) (только для Convert)
@@ -71,7 +95,7 @@ class CounterForm(StatesGroup):
 class UpdateRateForm(StatesGroup):
     update_rate = State()
 
-# ===== Mock rates =====
+# ====================== Mock rates ======================
 def get_mock_rates():
     return {
         "USD/UAH": round(random.uniform(39.8, 40.3), 2),
@@ -80,7 +104,7 @@ def get_mock_rates():
         "EUR/USD": round(random.uniform(1.05, 1.10), 2),
     }
 
-# ===== Keyboards =====
+# ====================== Keyboards ======================
 role_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="👤 Клиент", callback_data="role_client")],
     [InlineKeyboardButton(text="🏦 Банк", callback_data="role_bank")],
@@ -106,7 +130,7 @@ client_menu = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ===== Helpers =====
+# ====================== Helpers ======================
 def render_request(r: dict) -> str:
     status_icon = "⏳" if r["status"] == "pending" else "✅" if r["status"] == "approved" else "❌" if r["status"] == "rejected" else "💬"
     return (
@@ -116,7 +140,7 @@ def render_request(r: dict) -> str:
         f"👤 Клиент: {r['client_name']}"
     )
 
-async def notify_client(req_id: int, text: str, buttons: InlineKeyboardMarkup | None = None):
+async def notify_client(req_id: int, text: str, buttons: Optional[InlineKeyboardMarkup] = None):
     user_id = client_map.get(req_id)
     if not user_id:
         return
@@ -125,12 +149,12 @@ async def notify_client(req_id: int, text: str, buttons: InlineKeyboardMarkup | 
     except Exception as e:
         logging.warning("Failed to notify client %s for req %s: %s", user_id, req_id, e)
 
-# ===== Basic Handlers =====
+# ====================== BASIC HANDLERS ======================
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
     await message.answer("👋 Привет! Выберите роль:", reply_markup=role_kb)
 
-@dp.message(Command("help"))
+@dp.message(Command("help")))
 async def help_cmd(message: Message):
     await message.answer(
         "Доступные действия:\n"
@@ -156,7 +180,7 @@ async def set_role(callback: CallbackQuery):
         await callback.message.answer("✅ Роль установлена: Банк.\nИспользуйте /list для просмотра заявок.")
     await callback.answer()
 
-# ===== Client Flow =====
+# ====================== CLIENT FLOW ======================
 @dp.message(F.text == "➕ Новая заявка")
 async def new_request(message: Message, state: FSMContext):
     if user_roles.get(message.from_user.id) != "client":
@@ -265,7 +289,7 @@ async def step_confirm(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-# ===== /rate =====
+# ====================== /rate ======================
 @dp.message(F.text == "📊 Курс (/rate)")
 @dp.message(Command("rate"))
 async def show_rates(message: Message):
@@ -273,7 +297,7 @@ async def show_rates(message: Message):
     text = "\n".join([f"• {k}: {v}" for k, v in rates.items()])
     await message.answer(f"📊 *Текущие курсы:*\n{text}", parse_mode="Markdown")
 
-# ===== Bank Flow =====
+# ====================== BANK FLOW ======================
 @dp.message(Command("list"))
 async def list_requests(message: Message):
     if user_roles.get(message.from_user.id) != "bank":
@@ -362,40 +386,36 @@ async def update_client_rate(message: Message, state: FSMContext):
             await message.answer(f"✏ Новый курс {new_rate} отправлен банку по заявке #{req_id}.")
     await state.clear()
 
-# ===== Fallbacks for stale callbacks =====
+# ====================== Fallbacks for stale callbacks ======================
 STALE_SAFE_CALLBACKS = {"Sell", "Buy", "Convert", "USD", "EUR", "PLN", "confirm", "cancel"}
 
 @dp.callback_query(F.data.in_(STALE_SAFE_CALLBACKS))
 async def stale_flow_guard(callback: CallbackQuery, state: FSMContext):
     cur = await state.get_state()
     if cur is None:
-        await callback.message.answer("Сессия истекла после перезапуска сервиса. Начните заново: нажмите «➕ Новая заявка».")
+        await callback.message.answer("Сессия истекла. Начните заново: нажмите «➕ Новая заявка».")
         return await callback.answer()
 
 @dp.callback_query(F.data.startswith(("approve_", "reject_", "counter_")))
 async def stale_bank_guard(callback: CallbackQuery, state: FSMContext):
-    # сработает, если основной обработчик не зацепил (нет контекста)
     cur = await state.get_state()
     if cur is None:
-        await callback.message.answer("Контекст заявки недоступен (возможен перезапуск сервиса). Обновите список: /list")
+        await callback.message.answer("Контекст заявки недоступен (возможен перезапуск). Обновите список: /list")
         return await callback.answer()
 
 @dp.callback_query(F.data.startswith(("accept_counter_", "change_rate_")))
 async def stale_counter_guard(callback: CallbackQuery, state: FSMContext):
     cur = await state.get_state()
     if cur is None:
-        await callback.message.answer("Диалог по заявке истёк. Пожалуйста, откройте /list у Банка или создайте новую заявку.")
+        await callback.message.answer("Диалог по заявке истёк. Создайте новую заявку или обратитесь к Банку (/list).")
         return await callback.answer()
 
-# ===== Webhook Server =====
+# ====================== WEBHOOK SERVER ======================
 async def on_startup(app: web.Application):
     logging.info("Deleting old webhook (if any) and dropping pending updates")
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("Setting webhook to %s", WEBHOOK_URL)
-    await bot.set_webhook(
-        WEBHOOK_URL,
-        allowed_updates=["message", "callback_query"]
-    )
+    await bot.set_webhook(WEBHOOK_URL, allowed_updates=["message", "callback_query"])
 
 async def on_shutdown(app: web.Application):
     logging.info("Deleting webhook")
@@ -403,7 +423,7 @@ async def on_shutdown(app: web.Application):
         await bot.delete_webhook()
     finally:
         try:
-            await bot.session.close()  # важно для корректного shutdown
+            await bot.session.close()  # важно закрыть aiohttp-сессию
         except Exception as e:
             logging.warning("Bot session close warning: %s", e)
 
@@ -411,7 +431,7 @@ async def handle(request: web.Request):
     try:
         data = await request.json()
         logging.info("Incoming update keys: %s", list(data.keys()))
-        update = types.Update.model_validate(data)  # надежный парсинг для aiogram 3
+        update = types.Update.model_validate(data)  # pydantic v2
         await dp.feed_update(bot, update)
         return web.Response(text="ok")
     except Exception as e:
@@ -426,11 +446,10 @@ async def webhook_info(request: web.Request):
 
 app = web.Application()
 app.router.add_get("/", health)                     # healthcheck
-app.router.add_get(f"/{BOT_TOKEN}", webhook_info)   # опционально для удобной проверки
+app.router.add_get(f"/{BOT_TOKEN}", webhook_info)   # GET для проверки человеком
 app.router.add_post(f"/{BOT_TOKEN}", handle)        # сам вебхук
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
