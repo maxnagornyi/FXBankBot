@@ -154,7 +154,7 @@ async def notify_client(req_id: int, text: str, buttons: Optional[InlineKeyboard
 async def start_cmd(message: Message):
     await message.answer("👋 Привет! Выберите роль:", reply_markup=role_kb)
 
-@dp.message(Command("help")))
+@dp.message(Command("help"))
 async def help_cmd(message: Message):
     await message.answer(
         "Доступные действия:\n"
