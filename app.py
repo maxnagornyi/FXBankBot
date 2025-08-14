@@ -20,7 +20,9 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-REDIS_URL: Optional[str] = os.getenv("REDIS_URL")  # можно не задавать (тогда память)
+REDIS_URL: Optional[str] = os.getenv("REDIS_URL")  # можно не задавать
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")             # секрет для /restart?token=...
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise ValueError("❌ BOT_TOKEN или WEBHOOK_URL не найдены в окружении!")
@@ -53,7 +55,7 @@ if REDIS_URL:
                 return False
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -149,6 +151,44 @@ async def notify_client(req_id: int, text: str, buttons: Optional[InlineKeyboard
     except Exception as e:
         logging.warning("Failed to notify client %s for req %s: %s", user_id, req_id, e)
 
+# ====================== ADMIN: soft/hard restart ======================
+def _restart_process(delay_sec: float = 0.5):
+    """Жёсткий рестарт процесса: Render поднимет сервис заново."""
+    logging.warning("Process will exit in %.1fs for restart...", delay_sec)
+    loop = asyncio.get_running_loop()
+    loop.call_later(delay_sec, lambda: os._exit(0))
+
+async def _soft_reset_state():
+    """Мягкий рестарт: очистка in-memory и FSM без убийства процесса."""
+    requests_db.clear()
+    user_roles.clear()
+    client_map.clear()
+    counter_offers.clear()
+    try:
+        await dp.storage.close()
+        await dp.storage.wait_closed()
+    except Exception:
+        pass
+
+@dp.message(Command("restartbot"))
+async def restartbot_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("⛔ Недостаточно прав.")
+    await message.answer("♻️ Перезапускаю бота… 1–2 сек.")
+    _restart_process(0.5)
+
+@dp.message(Command("softreset"))
+async def softreset_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("⛔ Недостаточно прав.")
+    await _soft_reset_state()
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(WEBHOOK_URL, allowed_updates=["message", "callback_query"])
+    except Exception as e:
+        logging.warning("Re-set webhook after softreset warning: %s", e)
+    await message.answer("✅ Память очищена. Бот готов. Используйте /start.")
+
 # ====================== BASIC HANDLERS ======================
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
@@ -162,13 +202,9 @@ async def help_cmd(message: Message):
         "• /rate — посмотреть mock‑курсы\n"
         "• Клиент: «➕ Новая заявка»\n"
         "• Банк: /list — список заявок\n"
-        "• /reset — сбросить текущую сессию"
+        "• /softreset — мягкий сброс (админ)\n"
+        "• /restartbot — перезапуск (админ)"
     )
-
-@dp.message(Command("reset"))
-async def reset_cmd(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Сессию сбросил. Нажмите «➕ Новая заявка» и начните заново.")
 
 @dp.callback_query(F.data.startswith("role_"))
 async def set_role(callback: CallbackQuery):
@@ -316,8 +352,10 @@ async def list_requests(message: Message):
 async def bank_actions(callback: CallbackQuery, state: FSMContext):
     action, req_id_str = callback.data.split("_", 1)
     req_id = int(req_id_str)
+    found = False
     for r in requests_db:
         if r["id"] == req_id:
+            found = True
             if action == "approve":
                 r["status"] = "approved"
                 await callback.message.edit_text(f"✅ Заявка #{req_id} подтверждена!")
@@ -331,6 +369,8 @@ async def bank_actions(callback: CallbackQuery, state: FSMContext):
                 await callback.message.answer("Введите новый курс:")
                 await state.set_state(CounterForm.new_rate)
             break
+    if not found:
+        await callback.message.answer("Контекст заявки недоступен (возможен перезапуск). Обновите список: /list")
     await callback.answer()
 
 @dp.message(CounterForm.new_rate)
@@ -351,14 +391,17 @@ async def enter_counter_rate(message: Message, state: FSMContext):
                 [InlineKeyboardButton(text="✏ Изменить", callback_data=f"change_rate_{req_id}")],
             ])
             await notify_client(req_id, f"💬 Банк предложил новый курс по заявке #{req_id}: {new_rate}", buttons=kb)
+            break
     await state.clear()
 
 @dp.callback_query(F.data.startswith(("accept_counter_", "change_rate_")))
 async def handle_client_counter_response(callback: CallbackQuery, state: FSMContext):
     action, _, id_str = callback.data.split("_", 2)
     req_id = int(id_str)
+    found = False
     for r in requests_db:
         if r["id"] == req_id:
+            found = True
             if action == "accept":
                 if req_id in counter_offers:
                     r["rate"] = counter_offers[req_id]
@@ -369,6 +412,8 @@ async def handle_client_counter_response(callback: CallbackQuery, state: FSMCont
                 await callback.message.answer("Введите новый курс:")
                 await state.set_state(UpdateRateForm.update_rate)
             break
+    if not found:
+        await callback.message.answer("Диалог по заявке истёк. Попросите Банк прислать /list или создайте новую заявку.")
     await callback.answer()
 
 @dp.message(UpdateRateForm.update_rate)
@@ -384,6 +429,7 @@ async def update_client_rate(message: Message, state: FSMContext):
             r["rate"] = new_rate
             r["status"] = "pending"
             await message.answer(f"✏ Новый курс {new_rate} отправлен банку по заявке #{req_id}.")
+            break
     await state.clear()
 
 # ====================== Fallbacks for stale callbacks ======================
@@ -396,19 +442,10 @@ async def stale_flow_guard(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("Сессия истекла. Начните заново: нажмите «➕ Новая заявка».")
         return await callback.answer()
 
-@dp.callback_query(F.data.startswith(("approve_", "reject_", "counter_")))
-async def stale_bank_guard(callback: CallbackQuery, state: FSMContext):
-    cur = await state.get_state()
-    if cur is None:
-        await callback.message.answer("Контекст заявки недоступен (возможен перезапуск). Обновите список: /list")
-        return await callback.answer()
-
-@dp.callback_query(F.data.startswith(("accept_counter_", "change_rate_")))
-async def stale_counter_guard(callback: CallbackQuery, state: FSMContext):
-    cur = await state.get_state()
-    if cur is None:
-        await callback.message.answer("Диалог по заявке истёк. Создайте новую заявку или обратитесь к Банку (/list).")
-        return await callback.answer()
+# ====================== Generic fallback ======================
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Не понял 🤔\nОтправьте /start и выберите роль, или /help.")
 
 # ====================== WEBHOOK SERVER ======================
 async def on_startup(app: web.Application):
@@ -444,10 +481,24 @@ async def health(request: web.Request):
 async def webhook_info(request: web.Request):
     return web.Response(text="webhook endpoint (use POST)", content_type="text/plain")
 
+async def restart_http(request: web.Request):
+    token = request.query.get("token", "")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return web.Response(status=403, text="forbidden")
+    # ответим сразу, затем перезапустимся
+    asyncio.create_task(asyncio.sleep(0.2))
+    _restart_process(0.5)
+    return web.Response(text="restarting")
+
+async def warmup(request: web.Request):
+    return web.Response(text="ok")
+
 app = web.Application()
 app.router.add_get("/", health)                     # healthcheck
-app.router.add_get(f"/{BOT_TOKEN}", webhook_info)   # GET для проверки человеком
-app.router.add_post(f"/{BOT_TOKEN}", handle)        # сам вебхук
+app.router.add_get("/warmup", warmup)              # пинг/пробуждение
+app.router.add_get("/restart", restart_http)       # админ‑рестарт по HTTP
+app.router.add_get(f"/{BOT_TOKEN}", webhook_info)  # GET для проверки человеком
+app.router.add_post(f"/{BOT_TOKEN}", handle)       # сам вебхук
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
