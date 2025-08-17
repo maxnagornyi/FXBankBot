@@ -3,6 +3,9 @@ fastapi==0.111.0
 uvicorn[standard]==0.30.3
 redis==5.0.7
 aiohttp==3.9.5
+
+# Pydantic и core — проверенные версии с готовыми wheels для Linux/Python 3.12
 pydantic==2.6.4
 pydantic-core==2.16.3
+
 
