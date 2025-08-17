@@ -439,7 +439,7 @@ def _render_order_line(o: Dict) -> str:
     pid = o.get("id")
     return f"#{pid}: {desc} @ {rate} | {status}"
 
-@router.message(Command("orders")))
+@router.message(Command("orders"))
 async def bank_orders(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
@@ -540,22 +540,6 @@ async def cmd_ping(message: Message):
 @router.message(Command("alive"))
 async def cmd_alive(message: Message):
     await message.answer("✅ alive")
-
-
-# =========================
-# Global error handler (aiogram)
-# =========================
-@router.errors()
-async def aiogram_error_handler(event, exception):
-    log.error("Handler error: %r", exception, exc_info=True)
-    # отправляем пользователю мягкое сообщение, если контекст есть
-    try:
-        if hasattr(event, "update") and event.update.message:
-            with suppress(Exception):
-                await bot.send_message(event.update.message.chat.id, "❗️Произошла ошибка при обработке. Попробуйте ещё раз.")
-    except Exception:
-        pass
-    # важно: НЕ пробрасываем исключение дальше — чтобы не ронять диспетчер
 
 
 # =========================
