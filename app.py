@@ -1,8 +1,9 @@
 import os
 import logging
+import asyncio
 from contextlib import suppress
 from decimal import Decimal
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
@@ -20,9 +21,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import redis.asyncio as aioredis
 
 
-# -------------------------
+# =========================
 # ENV & Logging
-# -------------------------
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -35,6 +36,9 @@ BANK_PASSWORD = os.getenv("BANK_PASSWORD", "letmein")
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
+WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+WEBHOOK_WATCHDOG_INTERVAL = int(os.getenv("WEBHOOK_WATCHDOG_INTERVAL", "60"))  # сек
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -42,41 +46,41 @@ logging.basicConfig(
 log = logging.getLogger("FXBankBot")
 
 
-# -------------------------
-# FastAPI app (healthcheck + webhook)
-# -------------------------
+# =========================
+# FastAPI app
+# =========================
 app = FastAPI(title="FXBankBot")
 app.state.mode: Optional[str] = None
+app.state.watchdog_task: Optional[asyncio.Task] = None
 
-# -------------------------
-# Aiogram globals (init in startup)
-# -------------------------
+# =========================
+# Aiogram globals
+# =========================
 bot: Optional[Bot] = None
 dp: Optional[Dispatcher] = None
 router = Router()
 
-# -------------------------
-# Bank role (session logins)
-# -------------------------
+# =========================
+# Bank role sessions
+# =========================
 BANK_USERS = set()  # telegram user_ids with bank role (in-memory sessions)
 
-# -------------------------
+# =========================
 # FSM States
-# -------------------------
+# =========================
 class DealFSM(StatesGroup):
     client_name = State()
     operation_type = State()      # buy / sell / convert
     currency_from = State()       # for sell or convert
     currency_to = State()         # for buy or convert
     conversion_mode = State()     # for convert: "sell" or "buy"
-    amount = State()              # numeric (string kept)
-    rate = State()                # numeric (string kept)
-    confirm = State()
+    amount = State()              # numeric string
+    rate = State()                # numeric string
 
 
-# -------------------------
+# =========================
 # Helpers
-# -------------------------
+# =========================
 def parse_decimal(txt: str) -> Decimal:
     s = txt.strip().replace(" ", "").replace(",", ".")
     return Decimal(s)
@@ -104,9 +108,9 @@ def redis_conn() -> Optional[aioredis.Redis]:
     return None
 
 
-# -------------------------
-# Orders storage (Redis with safe in-memory fallback)
-# -------------------------
+# =========================
+# Orders storage (Redis + memory fallback)
+# =========================
 ORDER_COUNTER_KEY = "order:counter"
 
 def order_key(order_id: int) -> str:
@@ -133,10 +137,6 @@ async def order_next_id(r: Optional[aioredis.Redis]) -> int:
     return await _mem_next_id()
 
 async def order_create(payload: Dict) -> int:
-    """
-    Create order in Redis; if Redis is unavailable, use in-memory fallback.
-    Returns new order id.
-    """
     r = redis_conn()
     oid = await order_next_id(r)
     data = {
@@ -223,9 +223,9 @@ async def orders_list(status: Optional[str] = None, limit: int = 50) -> List[Dic
     return rows
 
 
-# -------------------------
-# Handlers — client side
-# -------------------------
+# =========================
+# Handlers — client
+# =========================
 @router.message(CommandStart())
 @router.message(Command("start"))
 @router.message(StateFilter("*"), F.text == "/start")
@@ -269,7 +269,6 @@ async def h_operation(message: Message, state: FSMContext):
         return await message.answer("Конверсия: укажите валюту, которую <b>продаёте</b> (например: EUR)", parse_mode=ParseMode.HTML)
     await message.answer("Выберите 1 (Покупка), 2 (Продажа) или 3 (Конверсия).")
 
-# --- SELL / CONVERT from ---
 @router.message(DealFSM.currency_from, F.text)
 async def h_currency_from(message: Message, state: FSMContext):
     cur = message.text.strip().upper()
@@ -285,7 +284,6 @@ async def h_currency_from(message: Message, state: FSMContext):
         await state.set_state(DealFSM.currency_to)
         return await message.answer("Укажите валюту, которую <b>хотите купить</b> (например: USD).", parse_mode=ParseMode.HTML)
 
-# --- BUY / CONVERT target ---
 @router.message(DealFSM.currency_to, F.text)
 async def h_currency_to(message: Message, state: FSMContext):
     cur = message.text.strip().upper()
@@ -325,7 +323,6 @@ async def h_conv_mode(message: Message, state: FSMContext):
 
 @router.message(DealFSM.amount, F.text)
 async def h_amount(message: Message, state: FSMContext):
-    # просто валидируем число, храним как строку
     try:
         parse_decimal(message.text)
     except Exception:
@@ -358,7 +355,7 @@ async def h_rate(message: Message, state: FSMContext):
     order = await order_get(oid)
     await state.clear()
 
-    # Human-readable summary
+    # summary
     op = order["operation"]
     if op == "buy":
         summary = (
@@ -398,12 +395,11 @@ async def h_rate(message: Message, state: FSMContext):
             await bot.send_message(uid, f"📥 Новая заявка #{oid}\n\n{summary}")
 
 
-# -------------------------
+# =========================
 # Rates stub
-# -------------------------
+# =========================
 @router.message(Command("rate"))
 async def cmd_rate(message: Message):
-    # Заглушка — позже подключим внешний API + маржу банка
     text = (
         "💱 Текущие курсы (заглушка):\n"
         "USD/UAH = 41.25\n"
@@ -415,9 +411,9 @@ async def cmd_rate(message: Message):
     await message.answer(text)
 
 
-# -------------------------
+# =========================
 # Bank role
-# -------------------------
+# =========================
 @router.message(Command("bank"))
 async def bank_login(message: Message):
     parts = message.text.strip().split(maxsplit=1)
@@ -443,21 +439,18 @@ def _render_order_line(o: Dict) -> str:
     pid = o.get("id")
     return f"#{pid}: {desc} @ {rate} | {status}"
 
-@router.message(Command("orders"))
+@router.message(Command("orders")))
 async def bank_orders(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
-    # optional status
     parts = message.text.strip().split(maxsplit=1)
-    status = None
+    status = "new"
     if len(parts) == 2:
         st = parts[1].strip().lower()
         if st in {"all", "new", "accepted", "rejected", "confirmed"}:
             status = st
         else:
             return await message.answer("Использование: /orders [all|new|accepted|rejected|confirmed]")
-    else:
-        status = "new"
     lst = await orders_list(status=None if status == "all" else status)
     if not lst:
         return await message.answer("Заявок нет.")
@@ -516,9 +509,9 @@ async def bank_confirm(message: Message):
         await bot.send_message(int(o["client_id"]), f"🏦 Ваша заявка #{oid} переведена в статус ордера.")
 
 
-# -------------------------
+# =========================
 # Service utils
-# -------------------------
+# =========================
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     storage_type = type(dp.storage).__name__ if dp else "unknown"
@@ -536,14 +529,38 @@ async def cmd_restart(message: Message, state: FSMContext):
     await state.clear()
     with suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
-    full = f"{WEBHOOK_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
+    full = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
     await bot.set_webhook(url=full, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
     await message.answer("♻️ Перезапуск: вебхук переустановлен.")
 
+@router.message(Command("ping"))
+async def cmd_ping(message: Message):
+    await message.answer("pong")
 
-# -------------------------
+@router.message(Command("alive"))
+async def cmd_alive(message: Message):
+    await message.answer("✅ alive")
+
+
+# =========================
+# Global error handler (aiogram)
+# =========================
+@router.errors()
+async def aiogram_error_handler(event, exception):
+    log.error("Handler error: %r", exception, exc_info=True)
+    # отправляем пользователю мягкое сообщение, если контекст есть
+    try:
+        if hasattr(event, "update") and event.update.message:
+            with suppress(Exception):
+                await bot.send_message(event.update.message.chat.id, "❗️Произошла ошибка при обработке. Попробуйте ещё раз.")
+    except Exception:
+        pass
+    # важно: НЕ пробрасываем исключение дальше — чтобы не ронять диспетчер
+
+
+# =========================
 # FastAPI endpoints
-# -------------------------
+# =========================
 class Health(BaseModel):
     status: str = "ok"
     mode: Optional[str] = None
@@ -552,33 +569,65 @@ class Health(BaseModel):
 async def health():
     return Health(status="ok", mode=app.state.mode)
 
-@app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid webhook token in path")
-    # Дополнительно проверим секретный заголовок от Telegram
+@app.post(WEBHOOK_PATH)
+async def webhook(request: Request):
+    # мягкая проверка заголовка: если он есть и не совпал — 403; если отсутствует — пропускаем
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret != WEBHOOK_SECRET:
+    if secret and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret token header")
+
     data = await request.json()
-    upd = Update.model_validate(data, context={"bot": bot})
-    await dp.feed_update(bot, upd)
+    try:
+        upd = Update.model_validate(data, context={"bot": bot})
+    except Exception as e:
+        log.warning("Bad update payload: %r", e, exc_info=True)
+        return Response(status_code=200)
+
+    # обработаем update асинхронно, чтобы ответить Telegram мгновенно (и не уронить процесс)
+    async def _process_update(update: Update):
+        try:
+            await dp.feed_update(bot, update)
+        except Exception as e:
+            log.error("Update processing failed: %r", e, exc_info=True)
+
+    asyncio.create_task(_process_update(upd))
     return Response(status_code=200)
 
 
-# -------------------------
+# =========================
+# Webhook watchdog (фоновая проверка)
+# =========================
+async def webhook_watchdog():
+    # Периодически проверяем, что вебхук на месте, и восстанавливаем при необходимости
+    await asyncio.sleep(5)
+    target = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
+    while True:
+        try:
+            info = await bot.get_webhook_info()
+            if not info.url or info.url != target:
+                log.warning("Webhook mismatch (%s) -> resetting to %s", info.url, target)
+                with suppress(Exception):
+                    await bot.delete_webhook(drop_pending_updates=False)
+                await bot.set_webhook(url=target, secret_token=WEBHOOK_SECRET, drop_pending_updates=False)
+                log.info("Webhook re-set to %s", target)
+        except Exception as e:
+            log.warning("Watchdog check failed: %r", e)
+        await asyncio.sleep(WEBHOOK_WATCHDOG_INTERVAL)
+
+
+# =========================
 # FastAPI lifecycle
-# -------------------------
+# =========================
 @app.on_event("startup")
 async def on_startup():
     global bot, dp
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     storage = await build_storage()
     dp = Dispatcher(storage=storage)
-    dp.include_router(router)  # подключаем роутеры ОДИН РАЗ здесь
+    dp.include_router(router)  # подключаем роутеры ОДИН РАЗ
 
     # ставим вебхук
-    full = f"{WEBHOOK_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
+    full = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
     with suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(
@@ -589,8 +638,13 @@ async def on_startup():
     app.state.mode = "webhook"
     log.info(f"Webhook set to {full}")
 
+    # запускаем watchdog
+    app.state.watchdog_task = asyncio.create_task(webhook_watchdog())
+
 @app.on_event("shutdown")
 async def on_shutdown():
+    if app.state.watchdog_task:
+        app.state.watchdog_task.cancel()
     with suppress(Exception):
         await bot.session.close()
     log.info("Shutdown complete.")
