@@ -8,9 +8,10 @@ from typing import Optional, Literal
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -35,9 +36,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Environment variable BOT_TOKEN is required.")
 
-WEBHOOK_BASE = os.getenv("WEBHOOK_URL")
+WEBHOOK_BASE = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "fxbankbot-secret")
-REDIS_URL = os.getenv("REDIS_URL")
+REDIS_URL = os.getenv("REDIS_URL")       # e.g. rediss://default:pass@host:6379/0
 PORT = int(os.getenv("PORT", "10000"))
 HOST = "0.0.0.0"
 
@@ -87,6 +88,7 @@ class DealFSM(StatesGroup):
 # Utils
 # ------------------------
 async def try_build_storage() -> object:
+    """Создаём RedisStorage (Upstash) с TLS. Fallback на MemoryStorage."""
     if not REDIS_URL:
         logger.info("REDIS_URL not set, using MemoryStorage.")
         return MemoryStorage()
@@ -100,7 +102,8 @@ async def try_build_storage() -> object:
             "retry_on_timeout": True,
         }
         if REDIS_URL.startswith("rediss://") and os.getenv("REDIS_SSL_NO_VERIFY") == "1":
-            conn_kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
+            conn_kwargs["ssl_cert_reqs"] = ssl.CERT_NONE  # не рекомендуется, только если CA ломается
+
         redis = Redis.from_url(REDIS_URL, **conn_kwargs)
         await redis.ping()
         logger.info("Connected to Redis, using RedisStorage.")
@@ -123,7 +126,7 @@ async def start_polling_task() -> None:
         return
     async def _run():
         try:
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            await dp.start_polling(bot)  # без allowed_updates — принимаем всё
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -148,10 +151,10 @@ async def switch_mode(new_mode: Mode) -> None:
         await bot.set_webhook(
             url=full_url,
             secret_token=WEBHOOK_SECRET,
-            allowed_updates=dp.resolve_used_update_types(),
-            drop_pending_updates=True,
+            drop_pending_updates=True,  # allowed_updates убраны
         )
         app.state.mode = "webhook"
+        logger.info(f"Switched to WEBHOOK mode: {full_url}")
     else:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
@@ -159,12 +162,16 @@ async def switch_mode(new_mode: Mode) -> None:
             pass
         await start_polling_task()
         app.state.mode = "polling"
+        logger.info("Switched to POLLING mode.")
 
 # ------------------------
 # Handlers
 # ------------------------
 @router.message(CommandStart())
+@router.message(Command("start"))
+@router.message(StateFilter("*"), F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
+    """Ловим /start в любом состоянии и даже как обычный текст."""
     await state.clear()
     await state.set_state(DealFSM.client_name)
     await message.answer(
@@ -180,6 +187,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 @router.message(Command("restart"))
 async def cmd_restart(message: Message, state: FSMContext):
+    """Очистка состояния пользователя и перезапуск режима (webhook/polling)."""
     await state.clear()
     info = ["Состояние пользователя очищено."]
     try:
@@ -324,6 +332,13 @@ async def sell_amount(message: Message, state: FSMContext):
     )
 
 # ------------------------
+# Error logger (на всякий случай)
+# ------------------------
+@router.errors()
+async def errors_handler(event, error):
+    logger.exception("Unhandled error: %r", error)
+
+# ------------------------
 # FastAPI endpoints
 # ------------------------
 class Health(BaseModel):
@@ -343,7 +358,7 @@ async def telegram_webhook(request: Request):
     if WEBHOOK_SECRET:
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403)
+            raise HTTPException(status_code=403, detail="Invalid secret token")
     raw = await request.json()
     update = Update.model_validate(raw, context={"bot": bot})
     await dp.feed_update(bot, update)
@@ -357,22 +372,24 @@ async def on_startup():
     global bot, dp
     bot = Bot(
         token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     storage = await try_build_storage()
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
+
     if WEBHOOK_BASE:
         full_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
         try:
             await bot.set_webhook(
                 url=full_url,
                 secret_token=WEBHOOK_SECRET,
-                allowed_updates=dp.resolve_used_update_types(),
-                drop_pending_updates=True,
+                drop_pending_updates=True,  # allowed_updates убраны
             )
             app.state.mode = "webhook"
+            logger.info(f"Webhook set to {full_url}")
         except Exception:
+            logger.exception("Failed to set webhook at startup, switching to polling:")
             await switch_mode("polling")
     else:
         await switch_mode("polling")
@@ -390,6 +407,7 @@ async def on_shutdown():
         await bot.session.close()
     except Exception:
         pass
+    logger.info("Shutdown complete.")
 
 # ------------------------
 if __name__ == "__main__":
