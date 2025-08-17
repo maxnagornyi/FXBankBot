@@ -1,4 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
+
 echo "Starting FXBankBot..."
-exec python3 app.py
-chmod +x start.sh
+
+# Запускаем FastAPI (uvicorn)
+exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}
+
