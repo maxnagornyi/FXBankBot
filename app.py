@@ -1,506 +1,291 @@
-import os
-import random
-import logging
 import asyncio
-from typing import Optional
+import hashlib
+import logging
+import os
+from decimal import Decimal, InvalidOperation
+from typing import Optional, Literal
 
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
-)
-from aiogram.fsm.context import FSMContext
+from fastapi import FastAPI, Request, Response, HTTPException
+from pydantic import BaseModel
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.filters import Command
-from dotenv import load_dotenv
-
-# ====================== ENV & LOGGING ======================
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-REDIS_URL: Optional[str] = os.getenv("REDIS_URL")  # можно не задавать
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")             # секрет для /restart?token=...
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-
-if not BOT_TOKEN or not WEBHOOK_URL:
-    raise ValueError("❌ BOT_TOKEN или WEBHOOK_URL не найдены в окружении!")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-
-bot = Bot(token=BOT_TOKEN)
-
-# ====================== Storage: Redis (если доступен) -> Memory ======================
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-storage = None
+from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
 
-if REDIS_URL:
-    try:
-        import redis.asyncio as redis  # pip install redis
-        from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
+# redis.asyncio — официальный async API для redis-py
+from redis.asyncio import Redis
 
-        r = redis.from_url(
-            REDIS_URL,
-            encoding="utf-8",
-            decode_responses=True,
-        )
+# ------------------------
+# Logging
+# ------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("FXBankBot")
 
-        async def _ping():
-            try:
-                await r.ping()
-                return True
-            except Exception as e:
-                logging.warning("Redis недоступен: %s — переключаюсь на память", e)
-                return False
+# ------------------------
+# Env variables
+# ------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Environment variable BOT_TOKEN is required.")
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+WEBHOOK_BASE = os.getenv("WEBHOOK_URL")  # e.g. https://your-service.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "fxbankbot-secret")
+REDIS_URL = os.getenv("REDIS_URL")  # e.g. rediss://default:pass@host:port/0  (Upstash/Redis Cloud)
+PORT = int(os.getenv("PORT", "10000"))
+HOST = "0.0.0.0"
 
-        if loop.run_until_complete(_ping()):
-            storage = RedisStorage(r, key_builder=DefaultKeyBuilder(with_destiny=True))
-            logging.info("FSM storage: Redis ENABLED")
-        else:
-            storage = MemoryStorage()
-            logging.info("FSM storage: MemoryStorage (fallback)")
-    except Exception as e:
-        logging.warning("Redis init error: %s — использую MemoryStorage", e)
-        storage = MemoryStorage()
-else:
-    storage = MemoryStorage()
-    logging.info("FSM storage: MemoryStorage (REDIS_URL не задан)")
+WEBHOOK_PATH = f"/webhook/{hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:18]}"
 
-dp = Dispatcher(storage=storage)
+# ------------------------
+# FastAPI app
+# ------------------------
+app = FastAPI(title="FXBankBot")
 
-# ====================== In-memory DB (для MVP) ======================
-requests_db = []         # [{id, operation, currency1, currency2, amount, rate, client_name, status}]
-user_roles = {}          # {user_id: "client"|"bank"}
-client_map = {}          # {request_id: client_user_id}
-counter_offers = {}      # {request_id: counter_rate}
+# ------------------------
+# Aiogram core (late init in startup)
+# ------------------------
+bot: Optional[Bot] = None
+dp: Optional[Dispatcher] = None
+router = Router()
 
-# ====================== FSM ======================
-class RequestForm(StatesGroup):
-    client_name = State()   # 1) имя клиента (первый шаг)
-    operation = State()     # 2) операция
-    currency1 = State()     # 3) валюта (покупки/продажи/первая)
-    currency2 = State()     # 4) (только для Convert)
-    amount = State()        # 5) сумма
-    rate = State()          # 6) курс
-    confirm = State()       # 7) подтверждение
+# Текущий режим работы
+Mode = Literal["webhook", "polling"]
+app.state.mode: Mode | None = None
+app.state.polling_task: Optional[asyncio.Task] = None
 
-class CounterForm(StatesGroup):
-    new_rate = State()
-
-class UpdateRateForm(StatesGroup):
-    update_rate = State()
-
-# ====================== Mock rates ======================
-def get_mock_rates():
-    return {
-        "USD/UAH": round(random.uniform(39.8, 40.3), 2),
-        "EUR/UAH": round(random.uniform(43.0, 44.0), 2),
-        "PLN/UAH": round(random.uniform(9.5, 9.9), 2),
-        "EUR/USD": round(random.uniform(1.05, 1.10), 2),
-    }
-
-# ====================== Keyboards ======================
-role_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="👤 Клиент", callback_data="role_client")],
-    [InlineKeyboardButton(text="🏦 Банк", callback_data="role_bank")],
-])
-
-operation_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💰 Sell", callback_data="Sell")],
-    [InlineKeyboardButton(text="💵 Buy", callback_data="Buy")],
-    [InlineKeyboardButton(text="🔄 Convert", callback_data="Convert")],
-])
-
-def currency_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="USD", callback_data="USD")],
-        [InlineKeyboardButton(text="EUR", callback_data="EUR")],
-        [InlineKeyboardButton(text="PLN", callback_data="PLN")],
-    ])
-
-client_menu = ReplyKeyboardMarkup(
+# ------------------------
+# Keyboards
+# ------------------------
+KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="➕ Новая заявка"), KeyboardButton(text="📊 Курс (/rate)")],
+        [KeyboardButton(text="Покупка"), KeyboardButton(text="Продажа")],
+        [KeyboardButton(text="Отмена")],
     ],
     resize_keyboard=True,
+    input_field_placeholder="Выберите операцию",
 )
 
-# ====================== Helpers ======================
-def render_request(r: dict) -> str:
-    status_icon = "⏳" if r["status"] == "pending" else "✅" if r["status"] == "approved" else "❌" if r["status"] == "rejected" else "💬"
-    return (
-        f"📌 Заявка #{r['id']} | {status_icon} {r['status'].upper()}\n"
-        f"💼 {r['operation']} {r['currency1']}/{r['currency2']} @ {r['rate']}\n"
-        f"💵 Сумма: {r['amount']}\n"
-        f"👤 Клиент: {r['client_name']}"
-    )
+# ------------------------
+# FSM States
+# ------------------------
+class DealFSM(StatesGroup):
+    client_name = State()
+    operation = State()
+    # BUY specific
+    buy_currency = State()
+    buy_budget_rub = State()
+    # SELL specific
+    sell_currency = State()
+    sell_amount_cur = State()
+    confirm = State()
 
-async def notify_client(req_id: int, text: str, buttons: Optional[InlineKeyboardMarkup] = None):
-    user_id = client_map.get(req_id)
-    if not user_id:
-        return
-    try:
-        await bot.send_message(user_id, text, reply_markup=buttons)
-    except Exception as e:
-        logging.warning("Failed to notify client %s for req %s: %s", user_id, req_id, e)
 
-# ====================== ADMIN: soft/hard restart ======================
-def _restart_process(delay_sec: float = 0.5):
-    """Жёсткий рестарт процесса: Render поднимет сервис заново."""
-    logging.warning("Process will exit in %.1fs for restart...", delay_sec)
-    loop = asyncio.get_running_loop()
-    loop.call_later(delay_sec, lambda: os._exit(0))
-
-async def _soft_reset_state():
-    """Мягкий рестарт: очистка in-memory и FSM без убийства процесса."""
-    requests_db.clear()
-    user_roles.clear()
-    client_map.clear()
-    counter_offers.clear()
-    try:
-        await dp.storage.close()
-        await dp.storage.wait_closed()
-    except Exception:
-        pass
-
-@dp.message(Command("restartbot"))
-async def restartbot_cmd(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return await message.answer("⛔ Недостаточно прав.")
-    await message.answer("♻️ Перезапускаю бота… 1–2 сек.")
-    _restart_process(0.5)
-
-@dp.message(Command("softreset"))
-async def softreset_cmd(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return await message.answer("⛔ Недостаточно прав.")
-    await _soft_reset_state()
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(WEBHOOK_URL, allowed_updates=["message", "callback_query"])
-    except Exception as e:
-        logging.warning("Re-set webhook after softreset warning: %s", e)
-    await message.answer("✅ Память очищена. Бот готов. Используйте /start.")
-
-# ====================== BASIC HANDLERS ======================
-@dp.message(Command("start"))
-async def start_cmd(message: Message):
-    await message.answer("👋 Привет! Выберите роль:", reply_markup=role_kb)
-
-@dp.message(Command("help"))
-async def help_cmd(message: Message):
-    await message.answer(
-        "Доступные действия:\n"
-        "• /start — выбрать роль (Клиент/Банк)\n"
-        "• /rate — посмотреть mock‑курсы\n"
-        "• Клиент: «➕ Новая заявка»\n"
-        "• Банк: /list — список заявок\n"
-        "• /softreset — мягкий сброс (админ)\n"
-        "• /restartbot — перезапуск (админ)"
-    )
-
-@dp.callback_query(F.data.startswith("role_"))
-async def set_role(callback: CallbackQuery):
-    role = callback.data.split("_", 1)[1]
-    user_roles[callback.from_user.id] = role
-    if role == "client":
-        await callback.message.answer("✅ Роль установлена: Клиент.\n📋 Меню:", reply_markup=client_menu)
-    else:
-        await callback.message.answer("✅ Роль установлена: Банк.\nИспользуйте /list для просмотра заявок.")
-    await callback.answer()
-
-# ====================== CLIENT FLOW ======================
-@dp.message(F.text == "➕ Новая заявка")
-async def new_request(message: Message, state: FSMContext):
-    if user_roles.get(message.from_user.id) != "client":
-        return await message.answer("⛔ Только для клиентов. Нажмите /start и выберите роль.")
-    await message.answer("Введите имя клиента:")
-    await state.set_state(RequestForm.client_name)
-
-@dp.message(RequestForm.client_name)
-async def step_client_name(message: Message, state: FSMContext):
-    await state.update_data(client_name=message.text.strip())
-    await message.answer("Выберите операцию:", reply_markup=operation_kb)
-    await state.set_state(RequestForm.operation)
-
-@dp.callback_query(RequestForm.operation)
-async def step_operation(callback: CallbackQuery, state: FSMContext):
-    op = callback.data
-    await state.update_data(operation=op)
-    if op == "Sell":
-        await callback.message.answer("Введите валюту продажи:", reply_markup=currency_kb())
-    elif op == "Buy":
-        await callback.message.answer("Введите валюту покупки:", reply_markup=currency_kb())
-    else:  # Convert
-        await callback.message.answer("Выберите первую валюту:", reply_markup=currency_kb())
-    await state.set_state(RequestForm.currency1)
-    await callback.answer()
-
-@dp.callback_query(RequestForm.currency1)
-async def step_currency1(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(currency1=callback.data)
-    data = await state.get_data()
-    op = data["operation"]
-    if op == "Convert":
-        await callback.message.answer("Выберите вторую валюту:", reply_markup=currency_kb())
-        await state.set_state(RequestForm.currency2)
-    else:
-        await callback.message.answer("Введите сумму (например: 0.5 mio):")
-        await state.set_state(RequestForm.amount)
-    await callback.answer()
-
-@dp.callback_query(RequestForm.currency2)
-async def step_currency2(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(currency2=callback.data)
-    await callback.message.answer("Введите сумму (например: 0.5 mio):")
-    await state.set_state(RequestForm.amount)
-    await callback.answer()
-
-@dp.message(RequestForm.amount)
-async def step_amount(message: Message, state: FSMContext):
-    amount = message.text.strip()
-    await state.update_data(amount=amount)
-    # Рекомендованный курс
-    rates = get_mock_rates()
-    data = await state.get_data()
-    cur1 = data["currency1"]
-    cur2 = data.get("currency2", "UAH")
-    pair = f"{cur1}/{cur2}"
-    recommended_rate = rates.get(pair, "нет данных")
-    await message.answer(f"💡 Рекомендованный курс: {recommended_rate}\nТеперь введите ваш курс:")
-    await state.set_state(RequestForm.rate)
-
-@dp.message(RequestForm.rate)
-async def step_rate(message: Message, state: FSMContext):
-    try:
-        rate = float(message.text.replace(",", "."))
-    except ValueError:
-        return await message.answer("❌ Неверный формат. Введите число.")
-    await state.update_data(rate=rate)
-    data = await state.get_data()
-    op, cur1, cur2 = data["operation"], data["currency1"], data.get("currency2", "UAH")
-    amount, client = data["amount"], data["client_name"]
-    text = (
-        "🔍 Подтвердите заявку:\n"
-        f"• Клиент: {client}\n"
-        f"• Операция: {op}\n"
-        f"• Валюта: {cur1}/{cur2}\n"
-        f"• Сумма: {amount}\n"
-        f"• Курс: {rate}\n"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")],
-    ])
-    await message.answer(text, reply_markup=kb)
-    await state.set_state(RequestForm.confirm)
-
-@dp.callback_query(RequestForm.confirm)
-async def step_confirm(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "confirm":
-        data = await state.get_data()
-        req_id = len(requests_db) + 1
-        currency2 = data.get("currency2", "UAH")
-        requests_db.append({
-            "id": req_id,
-            "operation": data["operation"],
-            "currency1": data["currency1"],
-            "currency2": currency2,
-            "amount": data["amount"],
-            "rate": data["rate"],
-            "client_name": data["client_name"],
-            "status": "pending",
-        })
-        client_map[req_id] = callback.from_user.id
-        await callback.message.answer(f"✅ Заявка #{req_id} отправлена банку!")
-    else:
-        await callback.message.answer("❌ Заявка отменена.")
-    await state.clear()
-    await callback.answer()
-
-# ====================== /rate ======================
-@dp.message(F.text == "📊 Курс (/rate)")
-@dp.message(Command("rate"))
-async def show_rates(message: Message):
-    rates = get_mock_rates()
-    text = "\n".join([f"• {k}: {v}" for k, v in rates.items()])
-    await message.answer(f"📊 *Текущие курсы:*\n{text}", parse_mode="Markdown")
-
-# ====================== BANK FLOW ======================
-@dp.message(Command("list"))
-async def list_requests(message: Message):
-    if user_roles.get(message.from_user.id) != "bank":
-        return await message.answer("⛔ Только для банка. Нажмите /start и выберите роль.")
-    if not requests_db:
-        return await message.answer("📭 Нет заявок.")
-    for r in requests_db:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{r['id']}")],
-            [InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{r['id']}")],
-            [InlineKeyboardButton(text="💬 Counter", callback_data=f"counter_{r['id']}")],
-        ])
-        await message.answer(render_request(r), reply_markup=kb)
-
-@dp.callback_query(F.data.startswith(("approve_", "reject_", "counter_")))
-async def bank_actions(callback: CallbackQuery, state: FSMContext):
-    action, req_id_str = callback.data.split("_", 1)
-    req_id = int(req_id_str)
-    found = False
-    for r in requests_db:
-        if r["id"] == req_id:
-            found = True
-            if action == "approve":
-                r["status"] = "approved"
-                await callback.message.edit_text(f"✅ Заявка #{req_id} подтверждена!")
-                await notify_client(req_id, f"✅ Ваша заявка #{req_id} одобрена банком!")
-            elif action == "reject":
-                r["status"] = "rejected"
-                await callback.message.edit_text(f"❌ Заявка #{req_id} отклонена!")
-                await notify_client(req_id, f"❌ Ваша заявка #{req_id} отклонена банком.")
-            elif action == "counter":
-                await state.update_data(req_id=req_id)
-                await callback.message.answer("Введите новый курс:")
-                await state.set_state(CounterForm.new_rate)
-            break
-    if not found:
-        await callback.message.answer("Контекст заявки недоступен (возможен перезапуск). Обновите список: /list")
-    await callback.answer()
-
-@dp.message(CounterForm.new_rate)
-async def enter_counter_rate(message: Message, state: FSMContext):
-    try:
-        new_rate = float(message.text.replace(",", "."))
-    except ValueError:
-        return await message.answer("❌ Неверный формат. Введите число.")
-    data = await state.get_data()
-    req_id = data["req_id"]
-    for r in requests_db:
-        if r["id"] == req_id:
-            r["status"] = "counter"
-            counter_offers[req_id] = new_rate
-            await message.answer(f"💬 Новый оффер по заявке #{req_id}: {new_rate}")
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_counter_{req_id}")],
-                [InlineKeyboardButton(text="✏ Изменить", callback_data=f"change_rate_{req_id}")],
-            ])
-            await notify_client(req_id, f"💬 Банк предложил новый курс по заявке #{req_id}: {new_rate}", buttons=kb)
-            break
-    await state.clear()
-
-@dp.callback_query(F.data.startswith(("accept_counter_", "change_rate_")))
-async def handle_client_counter_response(callback: CallbackQuery, state: FSMContext):
-    action, _, id_str = callback.data.split("_", 2)
-    req_id = int(id_str)
-    found = False
-    for r in requests_db:
-        if r["id"] == req_id:
-            found = True
-            if action == "accept":
-                if req_id in counter_offers:
-                    r["rate"] = counter_offers[req_id]
-                r["status"] = "pending"
-                await callback.message.answer(f"✅ Вы приняли курс {r['rate']} по заявке #{req_id}. Заявка отправлена банку.")
-            elif action == "change":
-                await state.update_data(req_id=req_id)
-                await callback.message.answer("Введите новый курс:")
-                await state.set_state(UpdateRateForm.update_rate)
-            break
-    if not found:
-        await callback.message.answer("Диалог по заявке истёк. Попросите Банк прислать /list или создайте новую заявку.")
-    await callback.answer()
-
-@dp.message(UpdateRateForm.update_rate)
-async def update_client_rate(message: Message, state: FSMContext):
-    try:
-        new_rate = float(message.text.replace(",", "."))
-    except ValueError:
-        return await message.answer("❌ Неверный формат. Введите число.")
-    data = await state.get_data()
-    req_id = data["req_id"]
-    for r in requests_db:
-        if r["id"] == req_id:
-            r["rate"] = new_rate
-            r["status"] = "pending"
-            await message.answer(f"✏ Новый курс {new_rate} отправлен банку по заявке #{req_id}.")
-            break
-    await state.clear()
-
-# ====================== Fallbacks for stale callbacks ======================
-STALE_SAFE_CALLBACKS = {"Sell", "Buy", "Convert", "USD", "EUR", "PLN", "confirm", "cancel"}
-
-@dp.callback_query(F.data.in_(STALE_SAFE_CALLBACKS))
-async def stale_flow_guard(callback: CallbackQuery, state: FSMContext):
-    cur = await state.get_state()
-    if cur is None:
-        await callback.message.answer("Сессия истекла. Начните заново: нажмите «➕ Новая заявка».")
-        return await callback.answer()
-
-# ====================== Generic fallback ======================
-@dp.message()
-async def fallback(message: Message):
-    await message.answer("Не понял 🤔\nОтправьте /start и выберите роль, или /help.")
-
-# ====================== WEBHOOK SERVER ======================
-async def on_startup(app: web.Application):
-    logging.info("Deleting old webhook (if any) and dropping pending updates")
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Setting webhook to %s", WEBHOOK_URL)
-    await bot.set_webhook(WEBHOOK_URL, allowed_updates=["message", "callback_query"])
-
-async def on_shutdown(app: web.Application):
-    logging.info("Deleting webhook")
-    try:
-        await bot.delete_webhook()
-    finally:
+# ------------------------
+# Utils
+# ------------------------
+async def try_build_storage() -> object:
+    """
+    Пытаемся создать RedisStorage; если не получилось — MemoryStorage.
+    Рекоммендация: Upstash (есть бесплатный тариф).
+    """
+    if REDIS_URL:
         try:
-            await bot.session.close()  # важно закрыть aiohttp-сессию
+            redis = Redis.from_url(
+                REDIS_URL,
+                encoding="utf-8",
+                decode_responses=True,
+                socket_connect_timeout=3,
+                socket_timeout=3,
+            )
+            await redis.ping()
+            logger.info("Connected to Redis, using RedisStorage.")
+            return RedisStorage(
+                redis=redis,
+                key_builder=DefaultKeyBuilder(with_bot_id=True, prefix="fxbank"),
+            )
         except Exception as e:
-            logging.warning("Bot session close warning: %s", e)
+            logger.warning(f"Redis unavailable ({e!r}), falling back to MemoryStorage.")
+    else:
+        logger.info("REDIS_URL not set, using MemoryStorage.")
+    return MemoryStorage()
 
-async def handle(request: web.Request):
+
+def parse_decimal(value: str) -> Decimal:
+    value = value.strip().replace(" ", "").replace(",", ".")
+    return Decimal(value)
+
+
+async def start_polling_task() -> None:
+    """
+    Запускаем long polling в фоне параллельно FastAPI.
+    """
+    if not (bot and dp):
+        raise RuntimeError("Bot/Dispatcher is not initialized")
+    if app.state.polling_task and not app.state.polling_task.done():
+        logger.info("Polling task already running.")
+        return
+    async def _run():
+        logger.info("Starting long polling...")
+        try:
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        except asyncio.CancelledError:
+            logger.info("Polling task cancelled.")
+        except Exception:
+            logger.exception("Polling crashed:")
+    app.state.polling_task = asyncio.create_task(_run())
+
+
+async def stop_polling_task() -> None:
+    task = app.state.polling_task
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Polling task stopped.")
+    app.state.polling_task = None
+
+
+async def switch_mode(new_mode: Mode) -> None:
+    """
+    Переключаемся между webhook и polling.
+    """
+    assert bot is not None and dp is not None
+    if new_mode == "webhook":
+        # Останавливаем polling, если шёл
+        await stop_polling_task()
+        full_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+        await bot.set_webhook(
+            url=full_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=True,
+        )
+        app.state.mode = "webhook"
+        logger.info(f"Switched to WEBHOOK mode: {full_url}")
+    else:
+        # Снимаем вебхук и стартуем polling
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+        await start_polling_task()
+        app.state.mode = "polling"
+        logger.info("Switched to POLLING mode.")
+
+
+# ------------------------
+# Handlers
+# ------------------------
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(DealFSM.client_name)
+    await message.answer(
+        "Привет! Я FXBankBot.\n\n"
+        "Давай оформим заявку. Сначала укажи <b>название клиента</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Текущая заявка отменена. Чтобы начать заново — отправьте /start.")
+
+
+@router.message(Command("restart"))
+async def cmd_restart(message: Message, state: FSMContext):
+    """
+    Ручной «перезапуск»: очищаем состояние пользователя и перезапускаем режим.
+    Если есть WEBHOOK_URL — пытаемся вернуться в webhook; если нет — polling.
+    """
+    await state.clear()
+    info = ["Состояние пользователя очищено."]
     try:
-        data = await request.json()
-        logging.info("Incoming update keys: %s", list(data.keys()))
-        update = types.Update.model_validate(data)  # pydantic v2
-        await dp.feed_update(bot, update)
-        return web.Response(text="ok")
+        if WEBHOOK_BASE:
+            await switch_mode("webhook")
+            full_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+            info.append(f"Вебхук переустановлен: <code>{full_url}</code>")
+        else:
+            await switch_mode("polling")
+            info.append("Включён режим long polling (WEBHOOK_URL не задан).")
+        await message.answer("Перезапуск выполнен:\n" + "\n".join(info), parse_mode=ParseMode.HTML)
     except Exception as e:
-        logging.exception("Error handling update: %s", e)
-        return web.Response(status=500, text="error")
+        logger.exception("Restart failed:")
+        await message.answer(
+            "Перезапуск выполнен частично.\n"
+            f"Ошибка при переключении режима: {e!r}\n"
+            "Бот продолжит работать в текущем режиме.",
+            parse_mode=ParseMode.HTML,
+        )
 
-async def health(request: web.Request):
-    return web.Response(text="ok")
 
-async def webhook_info(request: web.Request):
-    return web.Response(text="webhook endpoint (use POST)", content_type="text/plain")
+@router.message(DealFSM.client_name, F.text)
+async def ask_operation(message: Message, state: FSMContext):
+    client = message.text.strip()
+    if not client:
+        await message.answer("Название клиента не может быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(client_name=client)
+    await state.set_state(DealFSM.operation)
+    await message.answer(
+        f"Клиент: <b>{client}</b>\nВыберите операцию:",
+        reply_markup=KB_MAIN,
+        parse_mode=ParseMode.HTML,
+    )
 
-async def restart_http(request: web.Request):
-    token = request.query.get("token", "")
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-        return web.Response(status=403, text="forbidden")
-    # ответим сразу, затем перезапустимся
-    asyncio.create_task(asyncio.sleep(0.2))
-    _restart_process(0.5)
-    return web.Response(text="restarting")
 
-async def warmup(request: web.Request):
-    return web.Response(text="ok")
+@router.message(DealFSM.operation, F.text.lower().in_(("покупка", "купить")))
+async def op_buy(message: Message, state: FSMContext):
+    await state.update_data(operation="buy")
+    await state.set_state(DealFSM.buy_currency)
+    await message.answer(
+        "Покупка валюты.\n\nУкажите, <b>какую валюту покупаем</b> (например: USD, EUR, GBP).",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="USD"), KeyboardButton(text="EUR"), KeyboardButton(text="GBP")],
+                [KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+        ),
+        parse_mode=ParseMode.HTML,
+    )
 
-app = web.Application()
-app.router.add_get("/", health)                     # healthcheck
-app.router.add_get("/warmup", warmup)              # пинг/пробуждение
-app.router.add_get("/restart", restart_http)       # админ‑рестарт по HTTP
-app.router.add_get(f"/{BOT_TOKEN}", webhook_info)  # GET для проверки человеком
-app.router.add_post(f"/{BOT_TOKEN}", handle)       # сам вебхук
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
 
-if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+@router.message(DealFSM.operation, F.text.lower().in_(("продажа", "продать")))
+async def op_sell(message: Message, state: FSMContext):
+    await state.update_data(operation="sell")
+    await state.set_state(DealFSM.sell_currency)
+    await message.answer(
+        "Продажа валюты.\n\nУкажите, <b>какую валюту продаём</b> (например: USD, EUR, GBP).",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="USD"), KeyboardButton(text="EUR"), KeyboardButton(text="GBP")],
+                [KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(DealFSM.operation)
+async def op_unknown(message: Message):
+    await message.answer("Пожалуйста, выберите: «Покупка» или «Продажа» (или /cancel).")
+
+
+# ---- BUY FLOW ----
+@router.message(DealFSM.buy_currency, F.text)
+async def buy_currency(message: Message, state: FSMContext):
+    cur = message.text.strip().upper()
+    if len(cur) not in (3, 4):
+        await message.answer
