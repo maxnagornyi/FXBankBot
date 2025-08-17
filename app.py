@@ -1,122 +1,84 @@
-import asyncio
-import hashlib
-import logging
 import os
-import ssl
-from decimal import Decimal
-from typing import Optional, Literal
+import logging
+import asyncio
+from contextlib import suppress
 
-from fastapi import FastAPI, Request, Response, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, StateFilter
-from aiogram.types import Message, Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
-from aiogram.client.default import DefaultBotProperties
-from redis.asyncio import Redis
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.types import Message, Update
+from aiogram.fsm.state import StatesGroup, State
 
-# ------------------------
-# Logging
-# ------------------------
+import redis.asyncio as redis
+from aiogram.client.default import DefaultBotProperties
+
+
+# ----------------------------------------
+# Настройки
+# ----------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+REDIS_URL = os.getenv("REDIS_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "fxbank-secret")
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", 10000))
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("FXBankBot")
 
-# ------------------------
-# Env variables
-# ------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Environment variable BOT_TOKEN is required.")
 
-WEBHOOK_BASE = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "fxbankbot-secret")
-REDIS_URL = os.getenv("REDIS_URL")
-PORT = int(os.getenv("PORT", "10000"))
-HOST = "0.0.0.0"
-
-WEBHOOK_PATH = f"/webhook/{hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:18]}"
-
-# ------------------------
-# FastAPI app
-# ------------------------
-app = FastAPI(title="FXBankBot")
-
-# ------------------------
-# Aiogram core
-# ------------------------
-bot: Optional[Bot] = None
-dp: Optional[Dispatcher] = None
-router = Router()
-
-Mode = Literal["webhook", "polling"]
-app.state.mode: Optional[Mode] = None
-app.state.polling_task: Optional[asyncio.Task] = None
-
-# ------------------------
-# Keyboards
-# ------------------------
-KB_MAIN = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Покупка"), KeyboardButton(text="Продажа"), KeyboardButton(text="Конверсия")],
-        [KeyboardButton(text="Отмена")],
-    ],
-    resize_keyboard=True,
-)
-
-def kb_conversion(sell_cur: str, buy_cur: str) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=f"Хочу продать {sell_cur}"), KeyboardButton(text=f"Хочу купить {buy_cur}")],
-            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
-        ],
-        resize_keyboard=True,
-    )
-
-# ------------------------
-# FSM States
-# ------------------------
+# ----------------------------------------
+# FSM
+# ----------------------------------------
 class DealFSM(StatesGroup):
     client_name = State()
-    operation = State()
-    buy_currency = State()
-    sell_currency = State()
-    conv_sell_currency = State()
-    conv_buy_currency = State()
-    amount_mode = State()
-    amount_value = State()
+    operation_type = State()   # покупка / продажа / конверсия
+    currency_from = State()
+    currency_to = State()
+    conversion_mode = State()  # хочу продать / хочу купить
+    amount = State()
+    confirm = State()
 
-# ------------------------
-# Utils
-# ------------------------
-async def try_build_storage():
-    if not REDIS_URL:
-        return MemoryStorage()
-    try:
-        conn_kwargs = {"encoding": "utf-8", "decode_responses": True}
-        if REDIS_URL.startswith("rediss://") and os.getenv("REDIS_SSL_NO_VERIFY") == "1":
-            conn_kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
-        redis = Redis.from_url(REDIS_URL, **conn_kwargs)
-        await redis.ping()
-        return RedisStorage(redis=redis, key_builder=DefaultKeyBuilder(with_bot_id=True, prefix="fxbank"))
-    except Exception as e:
-        logger.warning(f"Redis недоступен: {e}")
-        return MemoryStorage()
 
-def parse_decimal(value: str) -> Decimal:
-    value = value.strip().replace(" ", "").replace(",", ".")
-    return Decimal(value)
+# ----------------------------------------
+# Init bot
+# ----------------------------------------
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 
-# ------------------------
+# Dispatcher + Storage
+async def get_storage():
+    if REDIS_URL:
+        try:
+            redis_client = redis.from_url(REDIS_URL)
+            await redis_client.ping()
+            logger.info("Connected to Redis, using RedisStorage.")
+            return RedisStorage(redis=redis_client, key_builder=DefaultKeyBuilder())
+        except Exception as e:
+            logger.warning(f"Redis недоступен: {e} — переключаюсь на MemoryStorage")
+    return MemoryStorage()
+
+
+storage = None
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+
+# ----------------------------------------
 # Handlers
-# ------------------------
+# ----------------------------------------
 @router.message(CommandStart())
 @router.message(Command("start"))
 @router.message(StateFilter("*"), F.text == "/start")
@@ -124,173 +86,169 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(DealFSM.client_name)
     await message.answer(
-        "Привет! Я FXBankBot.\n\nВведите <b>название клиента</b>:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
+        "Привет! Я FXBankBot.\n\n"
+        "Давай оформим заявку. Сначала укажи <b>название клиента</b>."
     )
 
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Заявка отменена. Чтобы начать заново — /start.", reply_markup=ReplyKeyboardRemove())
 
-# ---- Client name ----
-@router.message(DealFSM.client_name, F.text)
-async def client_name(message: Message, state: FSMContext):
-    await state.update_data(client_name=message.text.strip())
-    await state.set_state(DealFSM.operation)
-    await message.answer("Выберите тип операции:", reply_markup=KB_MAIN)
-
-# ---- Operation choice ----
-@router.message(DealFSM.operation, F.text.lower().in_(("покупка",)))
-async def op_buy(message: Message, state: FSMContext):
-    await state.update_data(operation="buy")
-    await state.set_state(DealFSM.buy_currency)
-    await message.answer("Покупка: укажите валюту, которую хотите купить (например: USD, EUR).")
-
-@router.message(DealFSM.operation, F.text.lower().in_(("продажа",)))
-async def op_sell(message: Message, state: FSMContext):
-    await state.update_data(operation="sell")
-    await state.set_state(DealFSM.sell_currency)
-    await message.answer("Продажа: укажите валюту, которую хотите продать (например: USD, EUR).")
-
-@router.message(DealFSM.operation, F.text.lower().in_(("конверсия",)))
-async def op_conv(message: Message, state: FSMContext):
-    await state.update_data(operation="conversion")
-    await state.set_state(DealFSM.conv_sell_currency)
-    await message.answer("Конверсия: укажите валюту, которую продаёте (например: EUR).")
-
-# ---- Buy ----
-@router.message(DealFSM.buy_currency, F.text)
-async def buy_currency(message: Message, state: FSMContext):
-    cur = message.text.strip().upper()
-    await state.update_data(buy_currency=cur)
-    await state.set_state(DealFSM.amount_value)
-    await message.answer(f"Введите сумму {cur}, которую хотите купить:")
-
-# ---- Sell ----
-@router.message(DealFSM.sell_currency, F.text)
-async def sell_currency(message: Message, state: FSMContext):
-    cur = message.text.strip().upper()
-    await state.update_data(sell_currency=cur)
-    await state.set_state(DealFSM.amount_value)
-    await message.answer(f"Введите сумму {cur}, которую хотите продать:")
-
-# ---- Conversion ----
-@router.message(DealFSM.conv_sell_currency, F.text)
-async def conv_sell_currency(message: Message, state: FSMContext):
-    cur = message.text.strip().upper()
-    await state.update_data(conv_sell_currency=cur)
-    await state.set_state(DealFSM.conv_buy_currency)
-    await message.answer("Укажите валюту, которую хотите купить (например: USD).")
-
-@router.message(DealFSM.conv_buy_currency, F.text)
-async def conv_buy_currency(message: Message, state: FSMContext):
-    data = await state.get_data()
-    sell_cur = data.get("conv_sell_currency")
-    buy_cur = message.text.strip().upper()
-    await state.update_data(conv_buy_currency=buy_cur)
-    await state.set_state(DealFSM.amount_mode)
+@router.message(DealFSM.client_name)
+async def client_name_entered(message: Message, state: FSMContext):
+    await state.update_data(client_name=message.text)
+    await state.set_state(DealFSM.operation_type)
     await message.answer(
-        f"Как фиксируем заявку?\n"
-        f"• Хочу продать {sell_cur}\n"
-        f"• Хочу купить {buy_cur}",
-        reply_markup=kb_conversion(sell_cur, buy_cur),
+        "Выберите тип операции:\n"
+        "1️⃣ Покупка валюты за UAH\n"
+        "2️⃣ Продажа валюты за UAH\n"
+        "3️⃣ Конверсия (валюта → валюта)"
     )
 
-@router.message(DealFSM.amount_mode, F.text)
-async def conv_amount_mode(message: Message, state: FSMContext):
-    text = message.text.strip().lower()
-    data = await state.get_data()
-    sell_cur = data.get("conv_sell_currency")
-    buy_cur = data.get("conv_buy_currency")
-    if text == f"хочу продать {sell_cur}".lower():
-        await state.update_data(amount_mode="conv_sell")
-        await state.set_state(DealFSM.amount_value)
-        await message.answer(f"Введите сумму {sell_cur}, которую хотите продать:", reply_markup=ReplyKeyboardRemove())
-    elif text == f"хочу купить {buy_cur}".lower():
-        await state.update_data(amount_mode="conv_buy")
-        await state.set_state(DealFSM.amount_value)
-        await message.answer(f"Введите сумму {buy_cur}, которую хотите купить:", reply_markup=ReplyKeyboardRemove())
+
+@router.message(DealFSM.operation_type)
+async def choose_operation(message: Message, state: FSMContext):
+    choice = message.text.strip().lower()
+    if choice.startswith("1") or "покуп" in choice:
+        await state.update_data(operation="buy")
+        await state.set_state(DealFSM.currency_to)
+        await message.answer("Какую валюту хотите <b>купить</b>? (например: USD, EUR)")
+    elif choice.startswith("2") or "прод" in choice:
+        await state.update_data(operation="sell")
+        await state.set_state(DealFSM.currency_from)
+        await message.answer("Какую валюту хотите <b>продать</b>? (например: USD, EUR)")
+    elif choice.startswith("3") or "конверс" in choice:
+        await state.update_data(operation="convert")
+        await state.set_state(DealFSM.currency_from)
+        await message.answer("Укажите валюту, которую <b>продаёте</b> (например: USD)")
     else:
-        await message.answer("Выберите один из вариантов.", reply_markup=kb_conversion(sell_cur, buy_cur))
+        await message.answer("Выберите 1 (Покупка), 2 (Продажа) или 3 (Конверсия).")
 
-# ---- Amount input ----
-@router.message(DealFSM.amount_value, F.text)
-async def amount_value(message: Message, state: FSMContext):
-    try:
-        amount = parse_decimal(message.text)
-    except Exception:
-        await message.answer("Введите корректное число, например 1000000.")
-        return
 
+@router.message(DealFSM.currency_from)
+async def currency_from_entered(message: Message, state: FSMContext):
     data = await state.get_data()
-    client = data.get("client_name")
     op = data.get("operation")
 
-    await state.clear()
+    await state.update_data(currency_from=message.text.upper())
+
+    if op == "sell":
+        await state.set_state(DealFSM.amount)
+        await message.answer("Введите сумму, которую хотите <b>продать</b>.")
+    elif op == "convert":
+        await state.set_state(DealFSM.currency_to)
+        await message.answer("Укажите валюту, которую <b>хотите купить</b> (например: EUR).")
+
+
+@router.message(DealFSM.currency_to)
+async def currency_to_entered(message: Message, state: FSMContext):
+    data = await state.get_data()
+    op = data.get("operation")
+
+    await state.update_data(currency_to=message.text.upper())
 
     if op == "buy":
-        cur = data.get("buy_currency")
-        text = f"✅ Заявка\nКлиент: {client}\nОперация: Покупка\nКупить: {amount} {cur}"
-    elif op == "sell":
-        cur = data.get("sell_currency")
-        text = f"✅ Заявка\nКлиент: {client}\nОперация: Продажа\nПродать: {amount} {cur}"
-    else:  # conversion
-        sell_cur = data.get("conv_sell_currency")
-        buy_cur = data.get("conv_buy_currency")
-        mode = data.get("amount_mode")
-        if mode == "conv_sell":
-            text = f"✅ Заявка\nКлиент: {client}\nОперация: Конверсия\nПродать: {amount} {sell_cur} → Купить {buy_cur}"
-        else:
-            text = f"✅ Заявка\nКлиент: {client}\nОперация: Конверсия\nКупить: {amount} {buy_cur} ← Продать {sell_cur}"
+        await state.set_state(DealFSM.amount)
+        await message.answer("Введите сумму, которую хотите <b>купить</b>.")
+    elif op == "convert":
+        await state.set_state(DealFSM.conversion_mode)
+        await message.answer(
+            "Хотите указать:\n"
+            "1️⃣ Сколько продаёте\n"
+            "2️⃣ Сколько покупаете"
+        )
 
-    await message.answer(text, reply_markup=ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True
-    ))
 
-# ------------------------
-# FastAPI endpoints
-# ------------------------
-class Health(BaseModel):
-    status: str = "ok"
-    mode: Optional[str] = None
+@router.message(DealFSM.conversion_mode)
+async def conversion_mode_entered(message: Message, state: FSMContext):
+    choice = message.text.strip()
+    if choice.startswith("1"):
+        await state.update_data(conversion_mode="sell")
+        await state.set_state(DealFSM.amount)
+        await message.answer("Введите сумму, которую хотите <b>продать</b>.")
+    elif choice.startswith("2"):
+        await state.update_data(conversion_mode="buy")
+        await state.set_state(DealFSM.amount)
+        await message.answer("Введите сумму, которую хотите <b>купить</b>.")
+    else:
+        await message.answer("Выберите 1 (продаю) или 2 (покупаю).")
 
-@app.get("/", response_model=Health)
-async def healthcheck():
-    return Health(status="ok", mode=app.state.mode)
 
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    if WEBHOOK_SECRET:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403)
-    raw = await request.json()
-    update = Update.model_validate(raw, context={"bot": bot})
-    await dp.feed_update(bot, update)
-    return Response(status_code=200)
+@router.message(DealFSM.amount)
+async def amount_entered(message: Message, state: FSMContext):
+    await state.update_data(amount=message.text)
+    data = await state.get_data()
 
-# ------------------------
-# Startup / Shutdown
-# ------------------------
+    text = (
+        f"✅ Заявка оформлена:\n"
+        f"Клиент: {data.get('client_name')}\n"
+        f"Операция: {data.get('operation')}\n"
+        f"Валюта с: {data.get('currency_from')}\n"
+        f"Валюта на: {data.get('currency_to')}\n"
+        f"Сумма: {data.get('amount')}"
+    )
+    await state.clear()
+    await message.answer(text)
+
+
+# ----------------------------------------
+# /status и /restart
+# ----------------------------------------
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    text = f"🔎 Mode: webhook\nStorage: {'RedisStorage' if isinstance(storage, RedisStorage) else 'MemoryStorage'}"
+    if isinstance(storage, RedisStorage):
+        try:
+            pong = await storage.redis.ping()
+            text += f"\nRedis ping: {'ok' if pong else 'fail'}"
+        except Exception as e:
+            text += f"\nRedis error: {e}"
+    await message.answer(text)
+
+
+@router.message(Command("restart"))
+async def cmd_restart(message: Message, state: FSMContext):
+    await state.clear()
+    with suppress(Exception):
+        await bot.delete_webhook(drop_pending_updates=True)
+    full_url = f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}"
+    await bot.set_webhook(url=full_url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+    await message.answer("♻️ Бот перезапущен.")
+
+
+# ----------------------------------------
+# FastAPI app
+# ----------------------------------------
+app = FastAPI()
+
+
 @app.on_event("startup")
 async def on_startup():
-    global bot, dp
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    storage = await try_build_storage()
+    global storage, dp
+    storage = await get_storage()
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
 
-    if WEBHOOK_BASE:
-        full_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
-        await bot.set_webhook(url=full_url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
-        app.state.mode = "webhook"
-    else:
-        app.state.mode = "polling"
-        asyncio.create_task(dp.start_polling(bot))
+    # webhook
+    full_url = f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}"
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(url=full_url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+    logger.info("Bot started in webhook mode.")
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    if bot:
+    with suppress(Exception):
         await bot.session.close()
+    logger.info("Bot stopped.")
 
+
+@app.get("/")
+async def healthcheck():
+    return {"status": "ok", "mode": "webhook"}
+
+
+@app.post("/webhook/{token}")
+async def telegram_webhook(token: str, request: Request):
+    if token != WEBHOOK_SECRET:
+        return Response(status_code=403)
+    update = Update.model_validate(await request.json(), context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return Response(status_code=200)
