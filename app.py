@@ -16,6 +16,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
+from aiogram.client.default import DefaultBotProperties
 from redis.asyncio import Redis
 
 # ------------------------
@@ -77,7 +78,7 @@ class DealFSM(StatesGroup):
     client_name = State()
     operation = State()
     buy_currency = State()
-    buy_budget_uah = State()   # было rub
+    buy_budget_uah = State()
     sell_currency = State()
     sell_amount_cur = State()
     confirm = State()
@@ -89,7 +90,6 @@ async def try_build_storage() -> object:
     if not REDIS_URL:
         logger.info("REDIS_URL not set, using MemoryStorage.")
         return MemoryStorage()
-
     try:
         conn_kwargs = {
             "encoding": "utf-8",
@@ -101,7 +101,6 @@ async def try_build_storage() -> object:
         }
         if REDIS_URL.startswith("rediss://") and os.getenv("REDIS_SSL_NO_VERIFY") == "1":
             conn_kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
-
         redis = Redis.from_url(REDIS_URL, **conn_kwargs)
         await redis.ping()
         logger.info("Connected to Redis, using RedisStorage.")
@@ -233,7 +232,7 @@ async def op_buy(message: Message, state: FSMContext):
     await state.update_data(operation="buy")
     await state.set_state(DealFSM.buy_currency)
     await message.answer(
-        "Покупка валюты.\nУкажите <b>какую валюту покупаем</b> (например: USD, EUR, GBP).",
+        "Покупка валюты.\nУкажите, <b>какую валюту покупаем</b> (например: USD, EUR, GBP).",
         parse_mode=ParseMode.HTML,
     )
 
@@ -242,7 +241,7 @@ async def op_sell(message: Message, state: FSMContext):
     await state.update_data(operation="sell")
     await state.set_state(DealFSM.sell_currency)
     await message.answer(
-        "Продажа валюты.\nУкажите <b>какую валюту продаём</b> (например: USD, EUR, GBP).",
+        "Продажа валюты.\nУкажите, <b>какую валюту продаём</b> (например: USD, EUR, GBP).",
         parse_mode=ParseMode.HTML,
     )
 
@@ -356,7 +355,10 @@ async def telegram_webhook(request: Request):
 @app.on_event("startup")
 async def on_startup():
     global bot, dp
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
     storage = await try_build_storage()
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
