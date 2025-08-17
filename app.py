@@ -288,4 +288,186 @@ async def op_unknown(message: Message):
 async def buy_currency(message: Message, state: FSMContext):
     cur = message.text.strip().upper()
     if len(cur) not in (3, 4):
-        await message.answer
+        await message.answer("Некорректный код валюты. Пример: USD, EUR, GBP.")
+        return
+    await state.update_data(buy_currency=cur)
+    await state.set_state(DealFSM.buy_budget_rub)
+    await message.answer(
+        "Укажите <b>бюджет в RUB</b>, который готовы потратить (например: 100000 или 100000,50).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(DealFSM.buy_budget_rub, F.text)
+async def buy_budget(message: Message, state: FSMContext):
+    try:
+        budget = parse_decimal(message.text)
+        if budget <= 0:
+            raise InvalidOperation
+    except Exception:
+        await message.answer("Не получилось распознать сумму. Введите число, например 150000 или 150000,50.")
+        return
+
+    data = await state.get_data()
+    client = data.get("client_name")
+    currency = data.get("buy_currency")
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Заявка сохранена</b>\n\n"
+        f"Клиент: <b>{client}</b>\n"
+        f"Операция: <b>Покупка</b>\n"
+        f"Валюта: <b>{currency}</b>\n"
+        f"Бюджет: <b>{budget} RUB</b>\n\n"
+        "Чтобы оформить новую заявку — отправьте /start.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True),
+    )
+
+
+# ---- SELL FLOW ----
+@router.message(DealFSM.sell_currency, F.text)
+async def sell_currency(message: Message, state: FSMContext):
+    cur = message.text.strip().upper()
+    if len(cur) not in (3, 4):
+        await message.answer("Некорректный код валюты. Пример: USD, EUR, GBP.")
+        return
+    await state.update_data(sell_currency=cur)
+    await state.set_state(DealFSM.sell_amount_cur)
+    await message.answer(
+        f"Укажите <b>сумму {cur}</b>, которую хотите продать (например: 1000 или 1000,25).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(DealFSM.sell_amount_cur, F.text)
+async def sell_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    currency = data.get("sell_currency") or "XXX"
+
+    try:
+        amount = parse_decimal(message.text)
+        if amount <= 0:
+            raise InvalidOperation
+    except Exception:
+        await message.answer(
+            f"Не получилось распознать сумму в {currency}. Введите число, например 2500 или 2500,75."
+        )
+        return
+
+    client = data.get("client_name")
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Заявка сохранена</b>\n\n"
+        f"Клиент: <b>{client}</b>\n"
+        f"Операция: <b>Продажа</b>\n"
+        f"Валюта: <b>{currency}</b>\n"
+        f"Сумма: <b>{amount} {currency}</b>\n\n"
+        "Чтобы оформить новую заявку — отправьте /start.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True),
+    )
+
+
+# ------------------------
+# FastAPI endpoints
+# ------------------------
+class Health(BaseModel):
+    status: str = "ok"
+    mode: Optional[str] = None
+
+
+@app.get("/", response_model=Health)
+async def healthcheck():
+    """
+    Render healthcheck endpoint.
+    """
+    return Health(status="ok", mode=app.state.mode)
+
+
+@app.head("/")
+async def healthcheck_head():
+    return Response(status_code=200)
+
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """
+    Получатель Telegram webhook.
+    Проверяем X-Telegram-Bot-Api-Secret-Token, парсим Update и даём aiogram.
+    """
+    if WEBHOOK_SECRET:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid secret token")
+    try:
+        raw = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    try:
+        update = Update.model_validate(raw, context={"bot": bot})
+    except Exception as e:
+        logger.exception("Failed to validate Update:")
+        raise HTTPException(status_code=422, detail=f"Invalid Update: {e!r}")
+
+    await dp.feed_update(bot, update)
+    return Response(status_code=200)
+
+
+# ------------------------
+# Startup / Shutdown
+# ------------------------
+@app.on_event("startup")
+async def on_startup():
+    global bot, dp
+
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    storage = await try_build_storage()
+    dp = Dispatcher(storage=storage)
+    dp.include_router(router)
+
+    # Пытаемся включить webhook, если задан WEBHOOK_URL.
+    # Если не получится — автоматически уходим в polling.
+    if WEBHOOK_BASE:
+        full_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+        try:
+            await bot.set_webhook(
+                url=full_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=True,
+            )
+            app.state.mode = "webhook"
+            logger.info(f"Webhook set to {full_url}")
+        except Exception as e:
+            logger.exception("Failed to set webhook at startup, switching to polling:")
+            await switch_mode("polling")
+    else:
+        await switch_mode("polling")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        if app.state.mode == "polling":
+            await stop_polling_task()
+        else:
+            # Снимаем вебхук без дропа очереди (на всякий случай)
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+        await bot.session.close()
+    except Exception:
+        pass
+    logger.info("Shutdown complete.")
+
+
+# ------------------------
+# Local run helper
+# ------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host=HOST, port=PORT, reload=False, log_level="info")
