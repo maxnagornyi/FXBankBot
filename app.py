@@ -12,7 +12,10 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart, StateFilter
-from aiogram.types import Message, Update
+from aiogram.types import (
+    Message, Update,
+    ReplyKeyboardMarkup, KeyboardButton
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
@@ -36,8 +39,13 @@ BANK_PASSWORD = os.getenv("BANK_PASSWORD", "letmein")
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
+# Anti-silence toggles
+ASYNC_UPDATES = os.getenv("ASYNC_UPDATES", "true").lower() == "true"
+STRICT_HEADER = os.getenv("STRICT_HEADER", "false").lower() == "true"
+ENABLE_WATCHDOG = os.getenv("ENABLE_WATCHDOG", "true").lower() == "true"
+WEBHOOK_WATCHDOG_INTERVAL = int(os.getenv("WEBHOOK_WATCHDOG_INTERVAL", "60"))
+
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-WEBHOOK_WATCHDOG_INTERVAL = int(os.getenv("WEBHOOK_WATCHDOG_INTERVAL", "60"))  # сек
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -224,7 +232,37 @@ async def orders_list(status: Optional[str] = None, limit: int = 50) -> List[Dic
 
 
 # =========================
-# Handlers — client
+# Keyboards
+# =========================
+client_main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💱 Курсы"), KeyboardButton(text="➕ Новая заявка")],
+        [KeyboardButton(text="📋 Мои заявки")],
+    ],
+    resize_keyboard=True
+)
+
+client_order_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💵 Продажа"), KeyboardButton(text="💸 Покупка")],
+        [KeyboardButton(text="🔄 Конверсия")],
+        [KeyboardButton(text="⬅️ Назад")],
+    ],
+    resize_keyboard=True
+)
+
+bank_main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📋 Все заявки"), KeyboardButton(text="🆕 Новые заявки")],
+        [KeyboardButton(text="✅ Принятые"), KeyboardButton(text="❌ Отклонённые")],
+        [KeyboardButton(text="📌 Ордеры"), KeyboardButton(text="💱 Курсы")],
+    ],
+    resize_keyboard=True
+)
+
+
+# =========================
+# Handlers — client (with FSM)
 # =========================
 @router.message(CommandStart())
 @router.message(Command("start"))
@@ -234,8 +272,9 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(DealFSM.client_name)
     await message.answer(
         "👋 Привет! Я FXBankBot.\n\n"
-        "Начнём заявку. Сначала укажи <b>название клиента</b>.",
+        "Сначала укажи <b>название клиента</b>.",
         parse_mode=ParseMode.HTML,
+        reply_markup=client_main_kb
     )
 
 @router.message(DealFSM.client_name, F.text)
@@ -246,29 +285,32 @@ async def h_client_name(message: Message, state: FSMContext):
     await state.update_data(client_name=name)
     await state.set_state(DealFSM.operation_type)
     await message.answer(
-        "Выберите тип операции (можно цифрой):\n"
-        "1️⃣ Покупка валюты за UAH\n"
-        "2️⃣ Продажа валюты за UAH\n"
-        "3️⃣ Конверсия (валюта → валюта)"
+        "Выберите тип операции:",
+        reply_markup=client_order_kb
     )
 
-@router.message(DealFSM.operation_type, F.text)
-async def h_operation(message: Message, state: FSMContext):
-    choice = message.text.strip().lower()
-    if choice.startswith("1") or "покуп" in choice:
-        await state.update_data(operation="buy")
-        await state.set_state(DealFSM.currency_to)
-        return await message.answer("Какую валюту хотите <b>купить</b>? (например: USD, EUR)", parse_mode=ParseMode.HTML)
-    if choice.startswith("2") or "прод" in choice:
+@router.message(DealFSM.operation_type, F.text.in_(["💵 Продажа", "💸 Покупка", "🔄 Конверсия"]))
+async def h_operation_choice(message: Message, state: FSMContext):
+    t = message.text
+    if t == "💵 Продажа":
         await state.update_data(operation="sell")
         await state.set_state(DealFSM.currency_from)
         return await message.answer("Какую валюту хотите <b>продать</b>? (например: USD, EUR)", parse_mode=ParseMode.HTML)
-    if choice.startswith("3") or "конверс" in choice:
+    if t == "💸 Покупка":
+        await state.update_data(operation="buy")
+        await state.set_state(DealFSM.currency_to)
+        return await message.answer("Какую валюту хотите <b>купить</b>? (например: USD, EUR)", parse_mode=ParseMode.HTML)
+    if t == "🔄 Конверсия":
         await state.update_data(operation="convert")
         await state.set_state(DealFSM.currency_from)
         return await message.answer("Конверсия: укажите валюту, которую <b>продаёте</b> (например: EUR)", parse_mode=ParseMode.HTML)
-    await message.answer("Выберите 1 (Покупка), 2 (Продажа) или 3 (Конверсия).")
 
+@router.message(F.text == "⬅️ Назад")
+async def back_to_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Главное меню:", reply_markup=client_main_kb)
+
+# --- SELL / CONVERT from ---
 @router.message(DealFSM.currency_from, F.text)
 async def h_currency_from(message: Message, state: FSMContext):
     cur = message.text.strip().upper()
@@ -284,6 +326,7 @@ async def h_currency_from(message: Message, state: FSMContext):
         await state.set_state(DealFSM.currency_to)
         return await message.answer("Укажите валюту, которую <b>хотите купить</b> (например: USD).", parse_mode=ParseMode.HTML)
 
+# --- BUY / CONVERT target ---
 @router.message(DealFSM.currency_to, F.text)
 async def h_currency_to(message: Message, state: FSMContext):
     cur = message.text.strip().upper()
@@ -319,7 +362,7 @@ async def h_conv_mode(message: Message, state: FSMContext):
         await state.set_state(DealFSM.amount)
         data = await state.get_data()
         return await message.answer(f"Введите сумму {data.get('currency_to')} для <b>покупки</b>.", parse_mode=ParseMode.HTML)
-    await message.answer("Выберите 1 (сколько продаёте) или 2 (сколько покупаете).")
+    await message.answer("Введите 1 (сколько продаёте) или 2 (сколько покупаете).")
 
 @router.message(DealFSM.amount, F.text)
 async def h_amount(message: Message, state: FSMContext):
@@ -396,9 +439,10 @@ async def h_rate(message: Message, state: FSMContext):
 
 
 # =========================
-# Rates stub
+# Rates stub (common)
 # =========================
 @router.message(Command("rate"))
+@router.message(F.text == "💱 Курсы")
 async def cmd_rate(message: Message):
     text = (
         "💱 Текущие курсы (заглушка):\n"
@@ -419,7 +463,7 @@ async def bank_login(message: Message):
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) == 2 and parts[1] == BANK_PASSWORD:
         BANK_USERS.add(message.from_user.id)
-        return await message.answer("🏦 Вы вошли как банк.")
+        return await message.answer("🏦 Вы вошли как банк.", reply_markup=bank_main_kb)
     await message.answer("❌ Неверный пароль. Используйте: /bank <пароль>")
 
 def _render_order_line(o: Dict) -> str:
@@ -440,17 +484,32 @@ def _render_order_line(o: Dict) -> str:
     return f"#{pid}: {desc} @ {rate} | {status}"
 
 @router.message(Command("orders"))
+@router.message(F.text.in_(["📋 Все заявки", "🆕 Новые заявки", "✅ Принятые", "❌ Отклонённые", "📌 Ордеры"]))
 async def bank_orders(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
-    parts = message.text.strip().split(maxsplit=1)
-    status = "new"
-    if len(parts) == 2:
-        st = parts[1].strip().lower()
-        if st in {"all", "new", "accepted", "rejected", "confirmed"}:
-            status = st
+    # map UI label to status
+    label_map = {
+        "📋 Все заявки": "all",
+        "🆕 Новые заявки": "new",
+        "✅ Принятые": "accepted",
+        "❌ Отклонённые": "rejected",
+        "📌 Ордеры": "confirmed"
+    }
+    status = None
+    if message.text in label_map:
+        status = label_map[message.text]
+    else:
+        # /orders [status]
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) == 2:
+            st = parts[1].strip().lower()
+            if st in {"all", "new", "accepted", "rejected", "confirmed"}:
+                status = st
+            else:
+                return await message.answer("Использование: /orders [all|new|accepted|rejected|confirmed]")
         else:
-            return await message.answer("Использование: /orders [all|new|accepted|rejected|confirmed]")
+            status = "new"
     lst = await orders_list(status=None if status == "all" else status)
     if not lst:
         return await message.answer("Заявок нет.")
@@ -537,10 +596,6 @@ async def cmd_restart(message: Message, state: FSMContext):
 async def cmd_ping(message: Message):
     await message.answer("pong")
 
-@router.message(Command("alive"))
-async def cmd_alive(message: Message):
-    await message.answer("✅ alive")
-
 
 # =========================
 # FastAPI endpoints
@@ -555,10 +610,17 @@ async def health():
 
 @app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
-    # мягкая проверка заголовка: если он есть и не совпал — 403; если отсутствует — пропускаем
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret token header")
+    # Проверка секрета в заголовке:
+    # - при STRICT_HEADER=True — строго
+    # - при STRICT_HEADER=False — мягко (если заголовок присутствует и не совпал — 403; если отсутствует — пропускаем)
+    if STRICT_HEADER:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid secret token header")
+    else:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret and secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid secret token header")
 
     data = await request.json()
     try:
@@ -567,22 +629,24 @@ async def webhook(request: Request):
         log.warning("Bad update payload: %r", e, exc_info=True)
         return Response(status_code=200)
 
-    # обработаем update асинхронно, чтобы ответить Telegram мгновенно (и не уронить процесс)
     async def _process_update(update: Update):
         try:
             await dp.feed_update(bot, update)
         except Exception as e:
             log.error("Update processing failed: %r", e, exc_info=True)
 
-    asyncio.create_task(_process_update(upd))
-    return Response(status_code=200)
+    if ASYNC_UPDATES:
+        asyncio.create_task(_process_update(upd))
+        return Response(status_code=200)
+    else:
+        await _process_update(upd)
+        return Response(status_code=200)
 
 
 # =========================
 # Webhook watchdog (фоновая проверка)
 # =========================
 async def webhook_watchdog():
-    # Периодически проверяем, что вебхук на месте, и восстанавливаем при необходимости
     await asyncio.sleep(5)
     target = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
     while True:
@@ -622,8 +686,9 @@ async def on_startup():
     app.state.mode = "webhook"
     log.info(f"Webhook set to {full}")
 
-    # запускаем watchdog
-    app.state.watchdog_task = asyncio.create_task(webhook_watchdog())
+    # запускаем watchdog (если включён)
+    if ENABLE_WATCHDOG:
+        app.state.watchdog_task = asyncio.create_task(webhook_watchdog())
 
 @app.on_event("shutdown")
 async def on_shutdown():
