@@ -2,7 +2,7 @@ import os
 import logging
 from contextlib import suppress
 from decimal import Decimal
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
@@ -56,9 +56,9 @@ dp: Optional[Dispatcher] = None
 router = Router()
 
 # -------------------------
-# Bank role (in-memory)
+# Bank role (session logins)
 # -------------------------
-BANK_USERS = set()  # telegram user_ids with bank role (sessional login)
+BANK_USERS = set()  # telegram user_ids with bank role (in-memory sessions)
 
 # -------------------------
 # FSM States
@@ -103,6 +103,12 @@ def redis_conn() -> Optional[aioredis.Redis]:
         return dp.storage.redis
     return None
 
+
+# -------------------------
+# Orders storage (Redis with safe in-memory fallback)
+# -------------------------
+ORDER_COUNTER_KEY = "order:counter"
+
 def order_key(order_id: int) -> str:
     return f"order:{order_id}"
 
@@ -112,20 +118,28 @@ def orders_index_all() -> str:
 def orders_index_status(status: str) -> str:
     return f"orders:status:{status}"
 
-ORDER_COUNTER_KEY = "order:counter"
+# In-memory fallback
+_MEM_ORDERS: Dict[int, Dict] = {}
+_MEM_COUNTER: int = 0
 
-async def order_next_id(r: aioredis.Redis) -> int:
-    return int(await r.incr(ORDER_COUNTER_KEY))
+async def _mem_next_id() -> int:
+    global _MEM_COUNTER
+    _MEM_COUNTER += 1
+    return _MEM_COUNTER
+
+async def order_next_id(r: Optional[aioredis.Redis]) -> int:
+    if r:
+        return int(await r.incr(ORDER_COUNTER_KEY))
+    return await _mem_next_id()
 
 async def order_create(payload: Dict) -> int:
-    """Create order in Redis, index it, return id."""
+    """
+    Create order in Redis; if Redis is unavailable, use in-memory fallback.
+    Returns new order id.
+    """
     r = redis_conn()
-    if not r:
-        # Fallback in-memory minimal (edge case if no Redis): emulate counter in memory via aiogram storage not available -> return fake id
-        # But normally we always have Redis for orders.
-        raise RuntimeError("Redis is required for orders storage in this build.")
     oid = await order_next_id(r)
-    payload = {
+    data = {
         "id": str(oid),
         "status": payload.get("status", "new"),
         "client_id": str(payload["client_id"]),
@@ -138,57 +152,75 @@ async def order_create(payload: Dict) -> int:
         "rate": payload.get("rate", ""),
         "proposed_rate": payload.get("proposed_rate", ""),
     }
-    await r.hset(order_key(oid), mapping=payload)
-    await r.sadd(orders_index_all(), oid)
-    await r.sadd(orders_index_status(payload["status"]), oid)
+    if r:
+        await r.hset(order_key(oid), mapping=data)
+        await r.sadd(orders_index_all(), oid)
+        await r.sadd(orders_index_status(data["status"]), oid)
+    else:
+        _MEM_ORDERS[oid] = data
     return oid
 
 async def order_get(oid: int) -> Optional[Dict]:
     r = redis_conn()
-    if not r:
-        return None
-    data = await r.hgetall(order_key(oid))
-    return data or None
+    if r:
+        data = await r.hgetall(order_key(oid))
+        return data or None
+    return _MEM_ORDERS.get(oid)
 
 async def order_change_status(oid: int, new_status: str, extra: Dict = None) -> Optional[Dict]:
     r = redis_conn()
-    if not r:
+    if r:
+        k = order_key(oid)
+        exists = await r.exists(k)
+        if not exists:
+            return None
+        old_status = await r.hget(k, "status")
+        pipe = r.pipeline()
+        pipe.hset(k, "status", new_status)
+        if extra:
+            pipe.hset(k, mapping=extra)
+        pipe.srem(orders_index_status(old_status or "new"), oid)
+        pipe.sadd(orders_index_status(new_status), oid)
+        await pipe.execute()
+        return await r.hgetall(k)
+    # memory flow
+    o = _MEM_ORDERS.get(oid)
+    if not o:
         return None
-    k = order_key(oid)
-    exists = await r.exists(k)
-    if not exists:
-        return None
-    old_status = await r.hget(k, "status")
-    pipe = r.pipeline()
-    pipe.hset(k, "status", new_status)
+    o["status"] = new_status
     if extra:
-        pipe.hset(k, mapping=extra)
-    # reindex
-    pipe.srem(orders_index_status(old_status or "new"), oid)
-    pipe.sadd(orders_index_status(new_status), oid)
-    await pipe.execute()
-    return await r.hgetall(k)
+        o.update(extra)
+    _MEM_ORDERS[oid] = o
+    return o
 
 async def orders_list(status: Optional[str] = None, limit: int = 50) -> List[Dict]:
     r = redis_conn()
-    if not r:
-        return []
-    ids: List[str]
-    if status and status != "all":
-        ids = list(await r.smembers(orders_index_status(status)))
-    else:
-        ids = list(await r.smembers(orders_index_all()))
-    # sort by numeric id asc
-    try:
-        ids_sorted = sorted((int(x) for x in ids))
-    except Exception:
-        ids_sorted = ids
-    result: List[Dict] = []
-    for oid in ids_sorted[:limit]:
-        data = await r.hgetall(order_key(int(oid)))
-        if data:
-            result.append(data)
-    return result
+    if r:
+        if status and status != "all":
+            ids = list(await r.smembers(orders_index_status(status)))
+        else:
+            ids = list(await r.smembers(orders_index_all()))
+        try:
+            ids_sorted = sorted((int(x) for x in ids))
+        except Exception:
+            ids_sorted = ids
+        result: List[Dict] = []
+        for oid in ids_sorted[:limit]:
+            data = await r.hgetall(order_key(int(oid)))
+            if data:
+                result.append(data)
+        return result
+    # memory flow
+    items = list(_MEM_ORDERS.items())
+    items.sort(key=lambda kv: int(kv[0]))
+    rows: List[Dict] = []
+    for oid, data in items:
+        if status and status != "all" and data.get("status") != status:
+            continue
+        rows.append(data)
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 # -------------------------
@@ -415,7 +447,7 @@ def _render_order_line(o: Dict) -> str:
 async def bank_orders(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
-    # parse optional status
+    # optional status
     parts = message.text.strip().split(maxsplit=1)
     status = None
     if len(parts) == 2:
@@ -450,7 +482,7 @@ async def bank_accept(message: Message):
     with suppress(Exception):
         await bot.send_message(int(o["client_id"]), f"🏦 Ваша заявка #{oid} принята банком.")
 
-@router.message(Command("reject")))
+@router.message(Command("reject"))
 async def bank_reject(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
@@ -467,7 +499,7 @@ async def bank_reject(message: Message):
     with suppress(Exception):
         await bot.send_message(int(o["client_id"]), f"🏦 Ваша заявка #{oid} отклонена. Новый курс: {new_rate}")
 
-@router.message(Command("confirm")))
+@router.message(Command("confirm"))
 async def bank_confirm(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
@@ -508,6 +540,7 @@ async def cmd_restart(message: Message, state: FSMContext):
     await bot.set_webhook(url=full, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
     await message.answer("♻️ Перезапуск: вебхук переустановлен.")
 
+
 # -------------------------
 # FastAPI endpoints
 # -------------------------
@@ -531,6 +564,7 @@ async def webhook(token: str, request: Request):
     upd = Update.model_validate(data, context={"bot": bot})
     await dp.feed_update(bot, upd)
     return Response(status_code=200)
+
 
 # -------------------------
 # FastAPI lifecycle
