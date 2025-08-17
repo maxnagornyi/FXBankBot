@@ -297,4 +297,4 @@ async def on_shutdown():
 # ------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host=HOST, port=PORT, reload=False, port=PORT)
+    uvicorn.run("app:app", host=HOST, port=PORT, reload=False)
