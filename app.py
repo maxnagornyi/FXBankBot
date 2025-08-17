@@ -330,7 +330,6 @@ async def h_client_name(message: Message, state: FSMContext):
     if not name:
         return await message.answer("Название клиента не может быть пустым. Введите ещё раз.")
     await state.update_data(client_name=name)
-    # если была «отложенная» кнопка — игнорируем, просто показываем меню выбора
     await state.set_state(DealFSM.operation_type)
     await message.answer("Выберите тип операции:", reply_markup=client_order_kb)
 
@@ -486,7 +485,7 @@ async def h_rate(message: Message, state: FSMContext):
 
     await message.answer(summary)
 
-    # notify bank users
+    # notify bank users (со встроенными кнопками действий)
     for uid in list(BANK_USERS):
         with suppress(Exception):
             await bot.send_message(uid, f"📥 Новая заявка #{oid}\n\n{summary}", reply_markup=bank_order_actions_kb(oid))
@@ -582,7 +581,6 @@ async def bank_orders(message: Message):
     if message.text in label_map:
         status = label_map[message.text]
     else:
-        # /orders [status]
         parts = message.text.strip().split(maxsplit=1)
         if len(parts) == 2:
             st = parts[1].strip().lower()
@@ -596,19 +594,61 @@ async def bank_orders(message: Message):
     lst = await orders_list(status=None if status == "all" else status)
     if not lst:
         return await message.answer("Заявок нет.")
-    # инлайн список заявок
-    kb_rows = []
+
+    # строим инлайн-клавиатуру (по 2 кнопки в ряд)
+    kb_rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
     for o in lst:
         oid = int(o["id"])
-        row.append(InlineKeyboardButton(text=f"#{oid} | {o['status']}", callback_data=f"bank:view:{oid}"))
+        btn = InlineKeyboardButton(
+            text=f"#{oid} | {o['status']}",
+            callback_data=f"bank:view:{oid}"
+        )
+        row.append(btn)
         if len(row) == 2:
             kb_rows.append(row)
             row = []
     if row:
         kb_rows.append(row)
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
     await message.answer("📋 Выберите заявку:", reply_markup=kb)
+
+# Дополнительно: если банкир напишет вручную "#1" или "1" — откроем карточку
+@router.message(F.text.regexp(r"^#?\d+$"))
+async def bank_open_by_text(message: Message):
+    if message.from_user.id not in BANK_USERS:
+        return
+    txt = message.text.lstrip("#").strip()
+    if not txt.isdigit():
+        return
+    oid = int(txt)
+    o = await order_get(oid)
+    if not o:
+        return await message.answer("Заявка не найдена.")
+    # отвечаем как bank:view
+    pr = o.get("proposed_rate")
+    pr_txt = f"\nПредложенный курс: {pr}" if pr else ""
+    op = o.get("operation")
+    if op == "buy":
+        desc = f"Купить: {o.get('amount')} {o.get('currency_to')}"
+    elif op == "sell":
+        desc = f"Продать: {o.get('amount')} {o.get('currency_from')}"
+    else:
+        cm = o.get("conversion_mode")
+        if cm == "sell":
+            desc = f"Конверсия {o.get('currency_from')}→{o.get('currency_to')} | продаёт {o.get('amount')} {o.get('currency_from')}"
+        else:
+            desc = f"Конверсия {o.get('currency_from')}→{o.get('currency_to')} | покупает {o.get('amount')} {o.get('currency_to')}"
+    text = (
+        f"Заявка #{oid}\n"
+        f"Клиент: {o.get('client_name')}\n"
+        f"Операция: {op}\n"
+        f"{desc}\n"
+        f"Курс клиента: {o.get('rate')}\n"
+        f"Статус: {o.get('status')}{pr_txt}"
+    )
+    await message.answer(text, reply_markup=bank_order_actions_kb(oid))
 
 # Просмотр заявки и действия — callback
 @router.callback_query(F.data.startswith("bank:view:"))
@@ -746,7 +786,6 @@ async def client_accept_counter(cb: CallbackQuery):
     await cb.answer("Курс принят")
     await cb.message.edit_reply_markup(reply_markup=None)
     with suppress(Exception):
-        # уведомим банк: всем активным BANK_USERS
         for uid in list(BANK_USERS):
             await bot.send_message(uid, f"✅ Клиент принял контр-курс по заявке #{oid}. Итоговый курс: {new_rate}")
     return
