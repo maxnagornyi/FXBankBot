@@ -13,8 +13,9 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.types import (
-    Message, Update,
-    ReplyKeyboardMarkup, KeyboardButton
+    Message, Update, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -74,7 +75,7 @@ router = Router()
 BANK_USERS = set()  # telegram user_ids with bank role (in-memory sessions)
 
 # =========================
-# FSM States
+# FSM States (client & bank)
 # =========================
 class DealFSM(StatesGroup):
     client_name = State()
@@ -84,6 +85,10 @@ class DealFSM(StatesGroup):
     conversion_mode = State()     # for convert: "sell" or "buy"
     amount = State()              # numeric string
     rate = State()                # numeric string
+
+class BankFSM(StatesGroup):
+    counter_order_id = State()    # waiting to input counter rate for this order
+    waiting_counter_rate = State()
 
 
 # =========================
@@ -201,7 +206,7 @@ async def order_change_status(oid: int, new_status: str, extra: Dict = None) -> 
     _MEM_ORDERS[oid] = o
     return o
 
-async def orders_list(status: Optional[str] = None, limit: int = 50) -> List[Dict]:
+async def orders_list(status: Optional[str] = None, limit: int = 50, client_id: Optional[int] = None) -> List[Dict]:
     r = redis_conn()
     if r:
         if status and status != "all":
@@ -216,6 +221,8 @@ async def orders_list(status: Optional[str] = None, limit: int = 50) -> List[Dic
         for oid in ids_sorted[:limit]:
             data = await r.hgetall(order_key(int(oid)))
             if data:
+                if client_id and str(client_id) != data.get("client_id"):
+                    continue
                 result.append(data)
         return result
     # memory flow
@@ -224,6 +231,8 @@ async def orders_list(status: Optional[str] = None, limit: int = 50) -> List[Dic
     rows: List[Dict] = []
     for oid, data in items:
         if status and status != "all" and data.get("status") != status:
+            continue
+        if client_id and str(client_id) != data.get("client_id"):
             continue
         rows.append(data)
         if len(rows) >= limit:
@@ -260,9 +269,33 @@ bank_main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+def bank_order_actions_kb(oid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"bank:accept:{oid}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"bank:reject:{oid}"),
+            ],
+            [
+                InlineKeyboardButton(text="💹 Контр-курс", callback_data=f"bank:counter:{oid}"),
+                InlineKeyboardButton(text="📌 Оформить ордер", callback_data=f"bank:order:{oid}"),
+            ],
+        ]
+    )
+
+def client_counter_choice_kb(oid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Принять курс", callback_data=f"client:accept:{oid}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"client:reject:{oid}"),
+            ]
+        ]
+    )
+
 
 # =========================
-# Handlers — client (with FSM)
+# Handlers — CLIENT (with FSM)
 # =========================
 @router.message(CommandStart())
 @router.message(Command("start"))
@@ -277,20 +310,41 @@ async def cmd_start(message: Message, state: FSMContext):
         reply_markup=client_main_kb
     )
 
+# Универсальный запуск "Новая заявка"
+@router.message(Command("new"))
+@router.message(F.text == "➕ Новая заявка")
+async def start_new_order(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("client_name"):
+        await state.set_state(DealFSM.client_name)
+        return await message.answer(
+            "📝 Введите <b>название клиента</b> для начала заявки.",
+            parse_mode=ParseMode.HTML
+        )
+    await state.set_state(DealFSM.operation_type)
+    await message.answer("Выберите тип операции:", reply_markup=client_order_kb)
+
 @router.message(DealFSM.client_name, F.text)
 async def h_client_name(message: Message, state: FSMContext):
     name = message.text.strip()
     if not name:
         return await message.answer("Название клиента не может быть пустым. Введите ещё раз.")
     await state.update_data(client_name=name)
+    # если была «отложенная» кнопка — игнорируем, просто показываем меню выбора
     await state.set_state(DealFSM.operation_type)
-    await message.answer(
-        "Выберите тип операции:",
-        reply_markup=client_order_kb
-    )
+    await message.answer("Выберите тип операции:", reply_markup=client_order_kb)
 
-@router.message(DealFSM.operation_type, F.text.in_(["💵 Продажа", "💸 Покупка", "🔄 Конверсия"]))
-async def h_operation_choice(message: Message, state: FSMContext):
+# выбор типа операции из любого состояния
+@router.message(StateFilter(None), F.text.in_(["💵 Продажа", "💸 Покупка", "🔄 Конверсия"]))
+@router.message(StateFilter("*"), F.text.in_(["💵 Продажа", "💸 Покупка", "🔄 Конверсия"]))
+async def op_choice_any_state(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("client_name"):
+        await state.clear()
+        await state.set_state(DealFSM.client_name)
+        return await message.answer("📝 Введите <b>название клиента</b>.", parse_mode=ParseMode.HTML)
+
+    await state.set_state(DealFSM.operation_type)
     t = message.text
     if t == "💵 Продажа":
         await state.update_data(operation="sell")
@@ -435,7 +489,7 @@ async def h_rate(message: Message, state: FSMContext):
     # notify bank users
     for uid in list(BANK_USERS):
         with suppress(Exception):
-            await bot.send_message(uid, f"📥 Новая заявка #{oid}\n\n{summary}")
+            await bot.send_message(uid, f"📥 Новая заявка #{oid}\n\n{summary}", reply_markup=bank_order_actions_kb(oid))
 
 
 # =========================
@@ -456,7 +510,34 @@ async def cmd_rate(message: Message):
 
 
 # =========================
-# Bank role
+# CLIENT — "Мои заявки"
+# =========================
+@router.message(F.text == "📋 Мои заявки")
+async def client_my_orders(message: Message):
+    lst = await orders_list(status="all", client_id=message.from_user.id)
+    if not lst:
+        return await message.answer("Пока нет заявок.")
+    lines = ["📋 Ваши заявки:"]
+    for o in lst:
+        op = o.get("operation")
+        if op == "buy":
+            desc = f"Покупка {o.get('amount')} {o.get('currency_to')}"
+        elif op == "sell":
+            desc = f"Продажа {o.get('amount')} {o.get('currency_from')}"
+        else:
+            cm = o.get("conversion_mode")
+            if cm == "sell":
+                desc = f"Конверсия {o.get('currency_from')}→{o.get('currency_to')} | продаёте {o.get('amount')} {o.get('currency_from')}"
+            else:
+                desc = f"Конверсия {o.get('currency_from')}→{o.get('currency_to')} | покупаете {o.get('amount')} {o.get('currency_to')}"
+        pr = o.get("proposed_rate")
+        pr_txt = f", предложенный курс: {pr}" if pr else ""
+        lines.append(f"#{o.get('id')}: {desc} @ {o.get('rate')} | {o.get('status')}{pr_txt}")
+    await message.answer("\n".join(lines))
+
+
+# =========================
+# Bank role — login & lists
 # =========================
 @router.message(Command("bank"))
 async def bank_login(message: Message):
@@ -481,14 +562,15 @@ def _render_order_line(o: Dict) -> str:
     rate = o.get("rate", "")
     status = o.get("status", "")
     pid = o.get("id")
-    return f"#{pid}: {desc} @ {rate} | {status}"
+    pr = o.get("proposed_rate")
+    pr_txt = f" | предложен {pr}" if pr else ""
+    return f"#{pid}: {desc} @ {rate} | {status}{pr_txt}"
 
 @router.message(Command("orders"))
 @router.message(F.text.in_(["📋 Все заявки", "🆕 Новые заявки", "✅ Принятые", "❌ Отклонённые", "📌 Ордеры"]))
 async def bank_orders(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
-    # map UI label to status
     label_map = {
         "📋 Все заявки": "all",
         "🆕 Новые заявки": "new",
@@ -510,62 +592,179 @@ async def bank_orders(message: Message):
                 return await message.answer("Использование: /orders [all|new|accepted|rejected|confirmed]")
         else:
             status = "new"
+
     lst = await orders_list(status=None if status == "all" else status)
     if not lst:
         return await message.answer("Заявок нет.")
-    lines = ["📋 Заявки:"]
+    # инлайн список заявок
+    kb_rows = []
+    row: List[InlineKeyboardButton] = []
     for o in lst:
-        lines.append(_render_order_line(o))
-    await message.answer("\n".join(lines))
+        oid = int(o["id"])
+        row.append(InlineKeyboardButton(text=f"#{oid} | {o['status']}", callback_data=f"bank:view:{oid}"))
+        if len(row) == 2:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await message.answer("📋 Выберите заявку:", reply_markup=kb)
 
-@router.message(Command("accept"))
-async def bank_accept(message: Message):
-    if message.from_user.id not in BANK_USERS:
-        return await message.answer("⛔ Доступ запрещён.")
-    parts = message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await message.answer("Использование: /accept <id>")
-    oid = int(parts[1])
+# Просмотр заявки и действия — callback
+@router.callback_query(F.data.startswith("bank:view:"))
+async def bank_view_order(cb: CallbackQuery):
+    if cb.from_user.id not in BANK_USERS:
+        return await cb.answer("Нет доступа", show_alert=True)
+    oid = int(cb.data.split(":")[2])
     o = await order_get(oid)
     if not o:
-        return await message.answer("Нет такой заявки.")
-    o = await order_change_status(oid, "accepted")
-    await message.answer(f"✅ Заявка #{oid} принята.")
+        return await cb.answer("Заявка не найдена", show_alert=True)
+    # текст карточки
+    op = o.get("operation")
+    if op == "buy":
+        desc = f"Купить: {o.get('amount')} {o.get('currency_to')}"
+    elif op == "sell":
+        desc = f"Продать: {o.get('amount')} {o.get('currency_from')}"
+    else:
+        cm = o.get("conversion_mode")
+        if cm == "sell":
+            desc = f"Конверсия {o.get('currency_from')}→{o.get('currency_to')} | продаёт {o.get('amount')} {o.get('currency_from')}"
+        else:
+            desc = f"Конверсия {o.get('currency_from')}→{o.get('currency_to')} | покупает {o.get('amount')} {o.get('currency_to')}"
+    pr = o.get("proposed_rate")
+    pr_txt = f"\nПредложенный курс: {pr}" if pr else ""
+    text = (
+        f"Заявка #{oid}\n"
+        f"Клиент: {o.get('client_name')}\n"
+        f"Операция: {op}\n"
+        f"{desc}\n"
+        f"Курс клиента: {o.get('rate')}\n"
+        f"Статус: {o.get('status')}{pr_txt}"
+    )
+    await cb.message.edit_text(text)
+    await cb.message.edit_reply_markup(reply_markup=bank_order_actions_kb(oid))
+    await cb.answer()
+
+# Действия банка: принять/отклонить/контр/ордер
+@router.callback_query(F.data.startswith("bank:accept:"))
+async def bank_accept_cb(cb: CallbackQuery):
+    if cb.from_user.id not in BANK_USERS:
+        return await cb.answer("Нет доступа", show_alert=True)
+    oid = int(cb.data.split(":")[2])
+    o = await order_get(oid)
+    if not o:
+        return await cb.answer("Заявка не найдена", show_alert=True)
+    o = await order_change_status(oid, "accepted", {"proposed_rate": ""})
+    await cb.answer("Заявка принята")
     with suppress(Exception):
         await bot.send_message(int(o["client_id"]), f"🏦 Ваша заявка #{oid} принята банком.")
+    return await bank_view_order(cb)
 
-@router.message(Command("reject"))
-async def bank_reject(message: Message):
-    if message.from_user.id not in BANK_USERS:
-        return await message.answer("⛔ Доступ запрещён.")
-    parts = message.text.strip().split(maxsplit=2)
-    if len(parts) < 3 or not parts[1].isdigit():
-        return await message.answer("Использование: /reject <id> <предложенный_курс>")
-    oid = int(parts[1])
-    new_rate = parts[2].strip()
+@router.callback_query(F.data.startswith("bank:reject:"))
+async def bank_reject_cb(cb: CallbackQuery):
+    if cb.from_user.id not in BANK_USERS:
+        return await cb.answer("Нет доступа", show_alert=True)
+    oid = int(cb.data.split(":")[2])
     o = await order_get(oid)
     if not o:
-        return await message.answer("Нет такой заявки.")
-    o = await order_change_status(oid, "rejected", {"proposed_rate": new_rate})
-    await message.answer(f"❌ Заявка #{oid} отклонена. Предложен курс {new_rate}.")
+        return await cb.answer("Заявка не найдена", show_alert=True)
+    # отклоняем без предложения курса
+    o = await order_change_status(oid, "rejected", {"proposed_rate": ""})
+    await cb.answer("Заявка отклонена")
     with suppress(Exception):
-        await bot.send_message(int(o["client_id"]), f"🏦 Ваша заявка #{oid} отклонена. Новый курс: {new_rate}")
+        await bot.send_message(int(o["client_id"]), f"🏦 Ваша заявка #{oid} отклонена банком.")
+    return await bank_view_order(cb)
 
-@router.message(Command("confirm"))
-async def bank_confirm(message: Message):
-    if message.from_user.id not in BANK_USERS:
-        return await message.answer("⛔ Доступ запрещён.")
-    parts = message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await message.answer("Использование: /confirm <id>")
-    oid = int(parts[1])
+@router.callback_query(F.data.startswith("bank:order:"))
+async def bank_order_cb(cb: CallbackQuery):
+    if cb.from_user.id not in BANK_USERS:
+        return await cb.answer("Нет доступа", show_alert=True)
+    oid = int(cb.data.split(":")[2])
     o = await order_get(oid)
     if not o:
-        return await message.answer("Нет такой заявки.")
+        return await cb.answer("Заявка не найдена", show_alert=True)
     o = await order_change_status(oid, "confirmed")
-    await message.answer(f"📌 Заявка #{oid} переведена в статус ордера.")
+    await cb.answer("Заявка переведена в ордер")
     with suppress(Exception):
         await bot.send_message(int(o["client_id"]), f"🏦 Ваша заявка #{oid} переведена в статус ордера.")
+    return await bank_view_order(cb)
+
+# Контр-курс — запрос курса
+@router.callback_query(F.data.startswith("bank:counter:"))
+async def bank_counter_cb(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in BANK_USERS:
+        return await cb.answer("Нет доступа", show_alert=True)
+    oid = int(cb.data.split(":")[2])
+    o = await order_get(oid)
+    if not o:
+        return await cb.answer("Заявка не найдена", show_alert=True)
+    await state.set_state(BankFSM.waiting_counter_rate)
+    await state.update_data(counter_order_id=oid)
+    await cb.answer()
+    await cb.message.reply(f"💹 Введите контр-курс для заявки #{oid} (число).")
+
+@router.message(BankFSM.waiting_counter_rate, F.text)
+async def bank_counter_rate_input(message: Message, state: FSMContext):
+    if message.from_user.id not in BANK_USERS:
+        await state.clear()
+        return await message.answer("⛔ Доступ запрещён.")
+    data = await state.get_data()
+    oid = int(data.get("counter_order_id", 0))
+    if not oid:
+        await state.clear()
+        return await message.answer("Не найдена заявка для контр-курса.")
+    try:
+        rate = parse_decimal(message.text)
+    except Exception:
+        return await message.answer("Курс должен быть числом. Пример: 40.25")
+    o = await order_get(oid)
+    if not o:
+        await state.clear()
+        return await message.answer("Заявка не найдена.")
+    # меняем статус на rejected и записываем proposed_rate
+    o = await order_change_status(oid, "rejected", {"proposed_rate": str(rate)})
+    await message.answer(f"Отправлен контр-курс {rate} по заявке #{oid}. Статус: rejected")
+    with suppress(Exception):
+        await bot.send_message(
+            int(o["client_id"]),
+            f"🏦 Банк предлагает новый курс по вашей заявке #{oid}: <b>{rate}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=client_counter_choice_kb(oid)
+        )
+    await state.clear()
+
+# Клиент отвечает на контр-курс
+@router.callback_query(F.data.startswith("client:accept:"))
+async def client_accept_counter(cb: CallbackQuery):
+    oid = int(cb.data.split(":")[2])
+    o = await order_get(oid)
+    if not o or str(cb.from_user.id) != str(o.get("client_id")):
+        return await cb.answer("Недоступно", show_alert=True)
+    # принятие контр-курса → статус accepted и меняем rate на proposed_rate
+    new_rate = o.get("proposed_rate") or o.get("rate")
+    o = await order_change_status(oid, "accepted", {"rate": new_rate, "proposed_rate": ""})
+    await cb.answer("Курс принят")
+    await cb.message.edit_reply_markup(reply_markup=None)
+    with suppress(Exception):
+        # уведомим банк: всем активным BANK_USERS
+        for uid in list(BANK_USERS):
+            await bot.send_message(uid, f"✅ Клиент принял контр-курс по заявке #{oid}. Итоговый курс: {new_rate}")
+    return
+
+@router.callback_query(F.data.startswith("client:reject:"))
+async def client_reject_counter(cb: CallbackQuery):
+    oid = int(cb.data.split(":")[2])
+    o = await order_get(oid)
+    if not o or str(cb.from_user.id) != str(o.get("client_id")):
+        return await cb.answer("Недоступно", show_alert=True)
+    # клиент отказался от контр-курса — просто очищаем proposed_rate, статус оставим rejected
+    o = await order_change_status(oid, "rejected", {"proposed_rate": ""})
+    await cb.answer("Вы отклонили предложение")
+    await cb.message.edit_reply_markup(reply_markup=None)
+    with suppress(Exception):
+        for uid in list(BANK_USERS):
+            await bot.send_message(uid, f"❌ Клиент отклонил контр-курс по заявке #{oid}.")
+    return
 
 
 # =========================
