@@ -294,7 +294,3 @@ async def on_shutdown():
     if bot:
         await bot.session.close()
 
-# ------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host=HOST, port=PORT, reload=False)
