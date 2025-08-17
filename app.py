@@ -434,7 +434,7 @@ async def bank_orders(message: Message):
         lines.append(_render_order_line(o))
     await message.answer("\n".join(lines))
 
-@router.message(Command("accept")))
+@router.message(Command("accept"))
 async def bank_accept(message: Message):
     if message.from_user.id not in BANK_USERS:
         return await message.answer("⛔ Доступ запрещён.")
