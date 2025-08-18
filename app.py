@@ -26,7 +26,6 @@ import redis.asyncio as redis
 # ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    # Не падаем, но логируем — на Render токен должен быть задан
     logging.getLogger("fxbank_bot_boot").error("BOT_TOKEN env var is missing!")
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "fxbank-secret").strip()
@@ -46,7 +45,7 @@ logging.basicConfig(
 logger = logging.getLogger("fxbank_bot")
 
 # ===================== FASTAPI =====================
-app = FastAPI(title="FXBankBot", version="1.0")
+app = FastAPI(title="FXBankBot", version="1.2.0")
 
 # ===================== REDIS (FSM) =====================
 try:
@@ -54,7 +53,6 @@ try:
     storage = RedisStorage(redis_conn)
 except Exception as e:
     logger.error(f"Redis init failed: {e}")
-    # На крайний случай можно было бы MemoryStorage, но по требованию — Redis
     raise
 
 # ===================== AIROGRAM CORE =====================
@@ -183,6 +181,13 @@ async def reply_safe(chat_id: int, text: str, **kwargs):
 def user_role(user_id: int) -> str:
     return user_roles.get(user_id, "client")
 
+async def safe_answer(callback: CallbackQuery, text: Optional[str] = None, show_alert: bool = False):
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except Exception as e:
+        # Игнорируем "query is too old" и т.п., просто логируем
+        logger.debug(f"callback.answer error: {e}")
+
 # ===================== COMMANDS & COMMON =====================
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -250,20 +255,19 @@ async def cq_role(callback: CallbackQuery):
     try:
         _, role = callback.data.split(":")
         if role not in ("client", "bank"):
-            await callback.answer("Неизвестная роль", show_alert=True)
+            await safe_answer(callback, "Неизвестная роль", show_alert=True)
             return
         user_roles[callback.from_user.id] = role
         if role == "bank":
-            await callback.message.edit_text("Роль установлена: 🏦 Банк", reply_markup=None)
+            await callback.message.edit_text("Роль установлена: 🏦 Банк")
             await callback.message.answer("Меню банка:", reply_markup=kb_main_bank())
         else:
-            await callback.message.edit_text("Роль установлена: 👤 Клиент", reply_markup=None)
+            await callback.message.edit_text("Роль установлена: 👤 Клиент")
             await callback.message.answer("Меню клиента:", reply_markup=kb_main_client())
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.error(f"cq_role failed: {e}")
-        with suppress(Exception):
-            await callback.answer("Ошибка", show_alert=True)
+        await safe_answer(callback, "Ошибка", show_alert=True)
 
 # ===================== CLIENT FSM =====================
 class ClientFSM(StatesGroup):
@@ -273,207 +277,225 @@ class ClientFSM(StatesGroup):
     entering_currency_to = State()
     entering_amount = State()
     entering_rate = State()
-# ==========================
-# Client FSM (client flow)
-# ==========================
-class ClientFSM(StatesGroup):
-    waiting_for_client_name = State()
-    waiting_for_operation = State()
-    waiting_for_currency_from = State()
-    waiting_for_currency_to = State()
-    waiting_for_amount = State()
-    waiting_for_rate = State()
 
-# Кнопка "➕ Новая заявка"
 @router.message(F.text == "➕ Новая заявка")
 async def new_order(message: Message, state: FSMContext):
-    await state.set_state(ClientFSM.waiting_for_client_name)
-    await message.answer("Введите название клиента:")
-
-# Ввод имени клиента
-@router.message(ClientFSM.waiting_for_client_name)
-async def process_client_name(message: Message, state: FSMContext):
-    await state.update_data(client_name=message.text.strip())
-    await state.set_state(ClientFSM.waiting_for_operation)
-    await message.answer("Выберите операцию:", reply_markup=operation_keyboard())
-
-# Выбор операции
-@router.message(ClientFSM.waiting_for_operation, F.text.in_(["Купить", "Продать", "Конверсия"]))
-async def process_operation(message: Message, state: FSMContext):
-    operation = message.text
-    await state.update_data(operation=operation)
-
-    if operation == "Конверсия":
-        await state.set_state(ClientFSM.waiting_for_currency_from)
-        await message.answer("Укажите валюту, которую продаём (например, USD):")
-    else:
-        await state.set_state(ClientFSM.waiting_for_currency_to)
-        await message.answer("Укажите валюту (например, USD):")
-
-# Валюта продажи (для конверсии)
-@router.message(ClientFSM.waiting_for_currency_from)
-async def process_currency_from(message: Message, state: FSMContext):
-    await state.update_data(currency_from=message.text.strip().upper())
-    await state.set_state(ClientFSM.waiting_for_currency_to)
-    await message.answer("Укажите валюту, которую покупаем (например, EUR):")
-
-# Валюта покупки (или основная для покупки/продажи)
-@router.message(ClientFSM.waiting_for_currency_to)
-async def process_currency_to(message: Message, state: FSMContext):
-    await state.update_data(currency_to=message.text.strip().upper())
-    await state.set_state(ClientFSM.waiting_for_amount)
-    await message.answer("Введите сумму:")
-
-# Сумма
-@router.message(ClientFSM.waiting_for_amount)
-async def process_amount(message: Message, state: FSMContext):
     try:
-        amount = float(message.text.replace(",", "."))
-    except ValueError:
-        await message.answer("Введите корректное число.")
-        return
+        # Только клиент может создавать заявки
+        if user_role(message.from_user.id) != "client":
+            return await message.answer("⛔ Создавать заявки может только роль 'Клиент'.", reply_markup=kb_main_client())
+        await state.set_state(ClientFSM.entering_client_name)
+        await message.answer("✍️ Введите название клиента (компания/ФИО):", reply_markup=ReplyKeyboardRemove())
+    except Exception as e:
+        logger.error(f"new_order failed: {e}")
+        await message.answer("⚠️ Не удалось начать создание заявки.")
 
-    await state.update_data(amount=amount)
-    await state.set_state(ClientFSM.waiting_for_rate)
-    await message.answer("Введите курс сделки:")
-
-# Курс
-@router.message(ClientFSM.waiting_for_rate)
-async def process_rate(message: Message, state: FSMContext):
+@router.message(ClientFSM.entering_client_name)
+async def fsm_client_name(message: Message, state: FSMContext):
     try:
-        rate = float(message.text.replace(",", "."))
+        client_name = (message.text or "").strip()
+        if not client_name:
+            return await message.answer("❌ Введите непустое имя клиента.")
+        await state.update_data(client_name=client_name)
+        await state.set_state(ClientFSM.choosing_deal)
+        await message.answer("Выберите тип сделки:", reply_markup=ikb_deal_type())
+    except Exception as e:
+        logger.error(f"fsm_client_name failed: {e}")
+        await message.answer("⚠️ Ошибка. Попробуйте ещё раз.")
+
+@router.callback_query(ClientFSM.choosing_deal, F.data.in_(["deal:buy", "deal:sell", "deal:convert"]))
+async def fsm_choose_deal(callback: CallbackQuery, state: FSMContext):
+    try:
+        deal = callback.data.split(":")[1]
+        await state.update_data(deal=deal)
+        await state.set_state(ClientFSM.entering_currency_from)
+        if deal == "convert":
+            await callback.message.answer("Введите валюту, которую ПРОДАЁМ (пример: USD):")
+        else:
+            await callback.message.answer("Введите валюту сделки (пример: USD):")
+        await safe_answer(callback)
+    except Exception as e:
+        logger.error(f"fsm_choose_deal failed: {e}")
+        await safe_answer(callback, "Ошибка", show_alert=True)
+
+@router.message(ClientFSM.entering_currency_from)
+async def fsm_currency_from(message: Message, state: FSMContext):
+    try:
+        cur = (message.text or "").upper().strip()
+        if not cur or len(cur) < 3:
+            return await message.answer("❌ Укажите код валюты, пример: USD, EUR, UAH.")
+        await state.update_data(currency_from=cur)
+        data = await state.get_data()
+        if data.get("deal") == "convert":
+            await state.set_state(ClientFSM.entering_currency_to)
+            await message.answer("Введите валюту, которую ПОКУПАЕМ (пример: EUR):")
+        else:
+            await state.update_data(currency_to="UAH")
+            await state.set_state(ClientFSM.entering_amount)
+            await message.answer("Введите сумму (число):")
+    except Exception as e:
+        logger.error(f"fsm_currency_from failed: {e}")
+        await message.answer("⚠️ Ошибка. Попробуйте ещё раз.")
+
+@router.message(ClientFSM.entering_currency_to)
+async def fsm_currency_to(message: Message, state: FSMContext):
+    try:
+        cur = (message.text or "").upper().strip()
+        if not cur or len(cur) < 3:
+            return await message.answer("❌ Укажите код валюты, пример: USD, EUR.")
+        await state.update_data(currency_to=cur)
+        await state.set_state(ClientFSM.entering_amount)
+        await message.answer("Введите сумму (число):")
+    except Exception as e:
+        logger.error(f"fsm_currency_to failed: {e}")
+        await message.answer("⚠️ Ошибка. Попробуйте ещё раз.")
+
+@router.message(ClientFSM.entering_amount)
+async def fsm_amount(message: Message, state: FSMContext):
+    try:
+        val = float((message.text or "").replace(",", "."))
+        if val <= 0:
+            raise ValueError("amount<=0")
+        await state.update_data(amount=val)
+        await state.set_state(ClientFSM.entering_rate)
+        await message.answer(
+            "Введите КУРС (ваш желаемый). Пара — BASE/QUOTE.\n"
+            "Примеры:\n"
+            "• Покупка/Продажа USD против UAH → курс USD/UAH\n"
+            "• Конверсия USD→EUR → курс USD/EUR"
+        )
     except ValueError:
-        await message.answer("Введите корректное число.")
+        await message.answer("❌ Введите положительное число. Пример: 1000.50")
+    except Exception as e:
+        logger.error(f"fsm_amount failed: {e}")
+        await message.answer("⚠️ Ошибка. Попробуйте ещё раз.")
+# ==============================
+# FSM: Client - продолжение
+# ==============================
+@router.message(ClientFSM.rate)
+async def fsm_rate(message: types.Message, state: FSMContext):
+    try:
+        rate = float(message.text)
+    except ValueError:
+        await message.answer("❌ Курс должен быть числом. Попробуйте еще раз.")
         return
 
     await state.update_data(rate=rate)
     data = await state.get_data()
 
-    # Генерация ID заявки
-    import uuid
-    order_id = str(uuid.uuid4())[:8]
-
-    # Сохраняем заявку в Redis
-    order = {
-        "id": order_id,
-        "client_name": data["client_name"],
-        "operation": data["operation"],
-        "currency_from": data.get("currency_from"),
-        "currency_to": data["currency_to"],
-        "amount": data["amount"],
-        "rate": data["rate"],
-        "status": "pending",
-    }
-    await redis.hset("orders", order_id, str(order))
-
-    await message.answer(
-        f"✅ Заявка создана:\n"
-        f"Клиент: {order['client_name']}\n"
-        f"Операция: {order['operation']}\n"
-        f"Из валюты: {order.get('currency_from', 'UAH')}\n"
-        f"В валюту: {order['currency_to']}\n"
-        f"Сумма: {order['amount']}\n"
-        f"Курс: {order['rate']}\n"
-        f"ID: {order_id}"
+    order = Order(
+        client_name=data["client_name"],
+        operation=data["operation"],
+        base_currency=data["base_currency"],
+        quote_currency=data.get("quote_currency", "UAH"),
+        amount=float(data["amount"]),
+        rate=rate,
     )
-    await state.clear()
-# ==========================
-# Bank logic (approve/reject orders)
-# ==========================
-@router.message(F.text == "📋 Все заявки")
-async def list_orders(message: Message):
-    orders = await redis.hgetall("orders")
-    if not orders:
-        await message.answer("❌ Заявок нет.")
+
+    await state.update_data(order=order)
+    await state.set_state(ClientFSM.confirm)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить", callback_data="confirm_order"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена", callback_data="cancel_order"
+                ),
+            ]
+        ]
+    )
+    await message.answer(
+        f"📋 Ваша заявка:\n\n{order}", reply_markup=kb
+    )
+
+
+# ==============================
+# FSM: Подтверждение
+# ==============================
+@router.callback_query(F.data == "confirm_order")
+async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    order: Order = data.get("order")
+
+    if not order:
+        await callback.answer("❌ Ошибка: заявка не найдена.", show_alert=True)
         return
 
-    for oid, odata in orders.items():
-        order = eval(odata)  # упрощённо, лучше JSON
-        text = (
-            f"📝 Заявка {order['id']}\n"
-            f"Клиент: {order['client_name']}\n"
-            f"Операция: {order['operation']}\n"
-            f"Из валюты: {order.get('currency_from', 'UAH')}\n"
-            f"В валюту: {order['currency_to']}\n"
-            f"Сумма: {order['amount']}\n"
-            f"Курс: {order['rate']}\n"
-            f"Статус: {order['status']}"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{order['id']}"),
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{order['id']}"),
-                ]
-            ]
-        )
-        await message.answer(text, reply_markup=kb)
+    # сохраняем в Redis
+    order_key = f"order:{callback.from_user.id}:{int(callback.message.date.timestamp())}"
+    await redis.set(order_key, order.model_dump_json(), ex=3600)
+
+    await callback.message.answer(
+        "✅ Заявка сохранена и отправлена банку.\nОжидайте ответа."
+    )
+    await state.clear()
 
 
+@router.callback_query(F.data == "cancel_order")
+async def cancel_order(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("❌ Заявка отменена.")
+    await state.clear()
+
+
+# ==============================
+# FSM: Bank actions
+# ==============================
 @router.callback_query(F.data.startswith("accept:"))
-async def accept_order(callback: CallbackQuery):
+async def cq_accept(callback: types.CallbackQuery):
     order_id = callback.data.split(":")[1]
-    odata = await redis.hget("orders", order_id)
-    if not odata:
+    data = await redis.get(order_id)
+    if not data:
         await callback.answer("❌ Заявка не найдена.", show_alert=True)
         return
 
-    order = eval(odata)
-    order["status"] = "accepted"
-    await redis.hset("orders", order_id, str(order))
-
-    await callback.message.edit_text(f"✅ Заявка {order_id} принята.")
-    await callback.answer("Принято")
+    order = Order.model_validate_json(data)
+    await callback.message.answer(f"✅ Заявка принята:\n\n{order}")
 
 
 @router.callback_query(F.data.startswith("reject:"))
-async def reject_order(callback: CallbackQuery):
+async def cq_reject(callback: types.CallbackQuery):
     order_id = callback.data.split(":")[1]
-    odata = await redis.hget("orders", order_id)
-    if not odata:
+    data = await redis.get(order_id)
+    if not data:
         await callback.answer("❌ Заявка не найдена.", show_alert=True)
         return
 
-    order = eval(odata)
-    order["status"] = "rejected"
-    await redis.hset("orders", order_id, str(order))
-
-    await callback.message.edit_text(f"❌ Заявка {order_id} отклонена.")
-    await callback.answer("Отклонено")
+    order = Order.model_validate_json(data)
+    await callback.message.answer(f"❌ Заявка отклонена:\n\n{order}")
 
 
-# ==========================
-# Startup & Webhook
-# ==========================
-app = FastAPI()
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-WEBHOOK_URL = f"{WEBAPP_URL}{WEBHOOK_PATH}"
-
-
+# ==============================
+# FastAPI endpoints
+# ==============================
 @app.on_event("startup")
 async def on_startup():
-    logger.info("Starting up application...")
-    # Подключение Redis
     global redis
-    redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    redis = aioredis.from_url(
+        REDIS_URL, decode_responses=True, encoding="utf-8"
+    )
     logger.info("Redis connected OK.")
 
-    # Ставим вебхук
+    # Webhook
+    await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
     logger.info(f"Webhook set to {WEBHOOK_URL}")
-    logger.info("Startup complete.")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await bot.session.close()
     await redis.close()
+    logger.info("Shutdown complete.")
 
 
 @app.post(WEBHOOK_PATH)
-async def webhook(update: dict):
-    telegram_update = Update(**update)
-    await dp.feed_update(bot, telegram_update)
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
     return {"ok": True}
 
 
