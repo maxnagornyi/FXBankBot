@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -79,7 +79,7 @@ RATES_HASH = "rates"                          # hash ccy->rate
 # -----------------------------
 # FastAPI & Aiogram init
 # -----------------------------
-app = FastAPI(title="FX Bank Bot", version="1.1.0")
+app = FastAPI(title="FX Bank Bot", version="1.1.1")
 
 # Redis connection (Upstash rediss:// ok)
 try:
@@ -215,24 +215,58 @@ async def set_commands() -> None:
         logger.error("set_my_commands failed: %s", e)
 
 
-async def set_webhook() -> None:
-    """Configure Telegram webhook using WEBHOOK_URL/RENDER_EXTERNAL_URL and fixed path."""
+async def _desired_webhook_url() -> Optional[str]:
+    if not WEBHOOK_BASE_URL:
+        return None
+    return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+
+
+async def set_webhook(force: bool = False) -> None:
+    """Configure Telegram webhook using WEBHOOK_URL/RENDER_EXTERNAL_URL and fixed path.
+    Skips re-setting if current webhook URL is already correct, to avoid Flood control.
+    """
     if not bot:
         logger.warning("Bot is None; skip set_webhook.")
         return
-    if not WEBHOOK_BASE_URL:
+    desired = await _desired_webhook_url()
+    if not desired:
         logger.warning("WEBHOOK_URL/RENDER_EXTERNAL_URL not set; skip webhook setup.")
         return
-    url = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+
+    try:
+        info = await bot.get_webhook_info()
+        current_url = (info.url or "").rstrip("/")
+    except Exception as e:
+        logger.warning("get_webhook_info failed: %s", e)
+        current_url = ""
+
+    if (current_url == desired.rstrip("/")) and not force:
+        logger.info("Webhook already set to %s — skip update.", desired)
+        return
+
     try:
         used_updates: List[str] = dp.resolve_used_update_types()
         await bot.set_webhook(
-            url=url,
+            url=desired,
             secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
+            drop_pending_updates=False,
             allowed_updates=used_updates,
         )
-        logger.info("Webhook set to %s (allowed_updates=%s)", url, used_updates)
+        logger.info("Webhook set to %s (allowed_updates=%s)", desired, used_updates)
+    except TelegramRetryAfter as e:
+        # Respect Telegram backoff to avoid flood-control
+        wait_s = int(getattr(e, "retry_after", 1) or 1)
+        logger.warning("Rate limited on set_webhook, sleep %ss then retry once...", wait_s)
+        await asyncio.sleep(wait_s)
+        with suppress(Exception):
+            used_updates = dp.resolve_used_update_types()
+            await bot.set_webhook(
+                url=desired,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=False,
+                allowed_updates=used_updates,
+            )
+            logger.info("Webhook set after retry to %s", desired)
     except TelegramBadRequest as e:
         logger.error("TelegramBadRequest on set_webhook: %s", e)
     except Exception as e:
@@ -240,13 +274,26 @@ async def set_webhook() -> None:
 
 
 async def watchdog_task():
-    """Optional watchdog: periodically ensure webhook is set."""
+    """Optional watchdog: periodically ensure webhook is set (only if mismatch)."""
     if not ENABLE_WATCHDOG:
         return
     logger.info("Watchdog enabled (interval=%ss).", WATCHDOG_INTERVAL)
     while True:
         try:
-            await set_webhook()
+            # only enforce if url mismatched
+            desired = await _desired_webhook_url()
+            if not desired:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+                continue
+            info = None
+            with suppress(Exception):
+                info = await bot.get_webhook_info()
+            current = (info.url if info else "") or ""
+            if current.rstrip("/") != desired.rstrip("/"):
+                logger.warning("Watchdog: webhook mismatch (current=%s, desired=%s). Fixing...", current, desired)
+                await set_webhook(force=True)
+            else:
+                logger.debug("Watchdog: webhook OK.")
         except Exception as e:
             logger.warning("Watchdog error: %s", e)
         await asyncio.sleep(WATCHDOG_INTERVAL)
@@ -441,6 +488,8 @@ async def cmd_bank(message: Message):
 # -----------------------------
 # Client handlers
 # -----------------------------
+from datetime import datetime
+
 @client_router.callback_query(F.data == "client:buy")
 async def cq_client_buy(callback: CallbackQuery, state: FSMContext):
     try:
@@ -872,12 +921,19 @@ async def healthcheck():
             logger.warning("Redis ping failed on healthcheck: %s", re)
             redis_ok = False
 
+        # Also show current webhook url for debugging
+        current_url = None
+        with suppress(Exception):
+            info = await bot.get_webhook_info() if bot else None
+            current_url = (info.url if info else None)
+
         return JSONResponse(
             {
                 "status": "ok",
                 "time": datetime.utcnow().isoformat() + "Z",
                 "redis": "ok" if redis_ok else "error",
                 "webhook_path": WEBHOOK_PATH,
+                "current_webhook": current_url,
                 "strict_header": STRICT_HEADER,
                 "async_updates": ASYNC_UPDATES,
             }
@@ -885,6 +941,12 @@ async def healthcheck():
     except Exception as e:
         logger.exception("Healthcheck error: %s", e)
         return JSONResponse({"status": "error"}, status_code=500)
+
+
+# HEAD / for uptime checkers (avoid 405)
+@app.head(HEALTHCHECK_PATH)
+async def health_head():
+    return PlainTextResponse("OK", status_code=200)
 
 
 @app.post(WEBHOOK_PATH)
@@ -936,7 +998,7 @@ async def on_startup():
     try:
         logger.info("Starting up application...")
         await set_commands()
-        await set_webhook()
+        await set_webhook()  # now idempotent
         if ENABLE_WATCHDOG:
             asyncio.create_task(watchdog_task())
         logger.info("Startup complete.")
