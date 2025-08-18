@@ -6,6 +6,8 @@ from typing import Dict, Optional
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -42,7 +44,10 @@ redis_conn = redis.from_url(REDIS_URL)
 storage = RedisStorage(redis=redis_conn)
 
 # ---------------------- BOT / DISPATCHER ----------------------
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
