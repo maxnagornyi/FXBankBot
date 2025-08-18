@@ -1,9 +1,10 @@
 import os
+import asyncio
 import logging
 from typing import Dict, Optional
 from contextlib import suppress
-
 import redis.asyncio as redis
+
 from fastapi import FastAPI, Request
 
 from aiogram import Bot, Dispatcher, Router, F, types
@@ -22,12 +23,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 
 # ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    logging.getLogger("fxbank_bot_boot").error("BOT_TOKEN env var is missing!")
-
 BANK_PASSWORD = os.getenv("BANK_PASSWORD", "bank123").strip()
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
 
@@ -37,12 +36,14 @@ WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
-# Render: предпочтительно брать WEBHOOK_URL, иначе RENDER_EXTERNAL_HOSTNAME
+# Render: предпочитаем явный WEBHOOK_URL, иначе RENDER_EXTERNAL_HOSTNAME
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or (
     f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
     if os.getenv("RENDER_EXTERNAL_HOSTNAME")
     else "https://fxbankbot.onrender.com"
 )
+
+WATCHDOG_INTERVAL = int(os.getenv("WEBHOOK_WATCHDOG_INTERVAL", "60"))  # сек
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -52,9 +53,11 @@ logging.basicConfig(
 logger = logging.getLogger("fxbank_bot")
 
 # ===================== FASTAPI =====================
-app = FastAPI(title="FXBankBot", version="1.7.0")
+app = FastAPI(title="FXBankBot", version="1.8.0")
 
 # ===================== REDIS (FSM) =====================
+redis_conn: Optional[redis.Redis] = None
+storage: Optional[RedisStorage] = None
 try:
     redis_conn = redis.from_url(REDIS_URL)
     storage = RedisStorage(redis_conn)
@@ -72,8 +75,7 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# ===================== RUNTIME (in-memory demo) =====================
-# Роли и заявки держим в памяти процесса (MVP). Persist можно будет вынести в Redis/DB.
+# ===================== RUNTIME STORAGE =====================
 user_roles: Dict[int, str] = {}  # user_id -> "client" | "bank"
 
 class Order:
@@ -89,7 +91,7 @@ class Order:
         currency_from: str,
         currency_to: Optional[str],  # UAH для buy/sell; валюта для convert
         rate: float,                 # курс клиента BASE/QUOTE
-        amount_side: Optional[str] = None,  # только для convert: "sell"|"buy"
+        amount_side: Optional[str] = None,  # для convert: "sell"|"buy"
     ):
         Order.counter += 1
         self.id = Order.counter
@@ -178,7 +180,7 @@ def ikb_bank_order(order_id: int) -> InlineKeyboardMarkup:
 
 # ===================== RATES (STUB) =====================
 def get_stub_rates() -> Dict[str, float]:
-    # базовый набор (позже подключим LSEG/Bloomberg)
+    # Позже подключим поставщика (LSEG/BBG)
     return {
         "USD/UAH": 41.25,
         "EUR/UAH": 45.10,
@@ -278,17 +280,16 @@ async def cq_role(callback: CallbackQuery):
         logger.error(f"cq_role failed: {e}")
         await safe_cb_answer(callback, "Ошибка", show_alert=True)
 
-# ===================== CLIENT FSM (states) =====================
+# ===================== CLIENT FSM =====================
 class ClientFSM(StatesGroup):
     entering_client_name = State()
     choosing_deal = State()
     entering_currency_from = State()
-    entering_currency_to = State()     # только для конверсии
-    choosing_amount_side = State()     # только для конверсии: sell/buy
+    entering_currency_to = State()     # для конверсии
+    choosing_amount_side = State()     # для конверсии: sell/buy
     entering_amount = State()
     entering_rate = State()
 
-# ===================== CLIENT FLOW =====================
 @router.message(F.text == "➕ Новая заявка")
 async def new_request(message: Message, state: FSMContext):
     try:
@@ -396,7 +397,7 @@ async def fsm_amount(message: Message, state: FSMContext):
             "Примеры:\n"
             "• Покупка/Продажа USD против UAH → курс USD/UAH\n"
             "• Конверсия USD→EUR → курс USD/EUR\n\n"
-            "Можно ввести пусто — тогда подставим заглушку."
+            "Можно оставить пусто — подставим заглушку."
         )
     except Exception as e:
         logger.error(f"fsm_amount failed: {e}")
@@ -508,21 +509,88 @@ async def cq_order(callback: CallbackQuery):
         logger.error(f"cq_order failed: {e}")
         await safe_cb_answer(callback, "⚠️ Ошибка", show_alert=True)
 
+# ===================== WEBHOOK MGMT =====================
+_watchdog_task: Optional[asyncio.Task] = None
+
+async def set_webhook_safely(url: str):
+    """
+    Ставит вебхук с защитой от Flood Control и подробным логом.
+    """
+    try:
+        # предварительно чистим (без ожидания неупавших апдейтов)
+        with suppress(Exception):
+            await bot.delete_webhook(drop_pending_updates=True)
+
+        await bot.set_webhook(
+            url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=["message", "callback_query"],
+        )
+        logger.info(f"Webhook set to {url}")
+    except TelegramRetryAfter as e:
+        delay = max(int(e.retry_after), 1)
+        logger.warning(f"Flood control on set_webhook. Retry after {delay}s")
+        await asyncio.sleep(delay)
+        # повтор
+        await bot.set_webhook(
+            url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=["message", "callback_query"],
+        )
+        logger.info(f"Webhook set to {url} (after retry)")
+    except TelegramBadRequest as e:
+        logger.error(f"BadRequest on set_webhook: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error on set_webhook: {e}")
+        raise
+
+async def webhook_watchdog():
+    """
+    Каждые WATCHDOG_INTERVAL секунд проверяет, что вебхук соответствует {WEBHOOK_BASE}{WEBHOOK_PATH}.
+    Если нет — переустанавливает.
+    """
+    desired = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+    while True:
+        try:
+            info = await bot.get_webhook_info()
+            current = info.url or ""
+            if current != desired:
+                logger.warning(f"Watchdog: webhook mismatch (current='{current}', desired='{desired}'). Fixing...")
+                with suppress(Exception):
+                    await set_webhook_safely(desired)
+            else:
+                # можно ещё проверять ip_address / allowed_updates при желании
+                logger.info("Watchdog: webhook OK.")
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+        await asyncio.sleep(WATCHDOG_INTERVAL)
+
 # ===================== FASTAPI ROUTES =====================
 @app.on_event("startup")
 async def on_startup():
-    webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
     try:
-        # Чистим старый, затем ставим новый вебхук с секретом
+        # Проверка Redis соединения, чтобы не подвисало FSM
         with suppress(Exception):
-            await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET, allowed_updates=["message", "callback_query"])
-        logger.info(f"Webhook set to {webhook_url}")
+            pong = await redis_conn.ping()
+            if pong:
+                logger.info("Redis connected OK.")
+
+        desired = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+        await set_webhook_safely(desired)
+
+        # Стартуем watchdog
+        global _watchdog_task
+        _watchdog_task = asyncio.create_task(webhook_watchdog())
+        logger.info(f"Startup complete. Watchdog enabled (interval={WATCHDOG_INTERVAL}s).")
     except Exception as e:
-        logger.error(f"Webhook setup failed: {e}")
+        logger.error(f"Startup failed: {e}")
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    with suppress(Exception):
+        if _watchdog_task:
+            _watchdog_task.cancel()
     with suppress(Exception):
         await redis_conn.close()
     with suppress(Exception):
@@ -531,18 +599,18 @@ async def on_shutdown():
 
 @app.get("/")
 async def index():
-    return {"status": "ok", "bot": "FXBankBot"}
+    return {"status": "ok", "bot": "FXBankBot", "webhook": f"{WEBHOOK_BASE}{WEBHOOK_PATH}"}
 
 @app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
     try:
         raw = await request.body()
-        # Парсим в Update
         update = types.Update.model_validate_json(raw)
-        # ВАЖНО: секрет передаём именованным аргументом!
+        # ВАЖНО: секрет передаём именованным аргументом, иначе третий аргумент — это timeout (int)
         await dp.feed_webhook_update(bot, update, secret_token=WEBHOOK_SECRET)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
+        return {"ok": False}
     return {"ok": True}
 
 # ===================== ENTRY =====================
