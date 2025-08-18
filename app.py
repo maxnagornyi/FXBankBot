@@ -1,11 +1,11 @@
 import os
 import logging
 import asyncio
-from contextlib import suppress
 from typing import Dict, Optional
+from contextlib import suppress
 
 from fastapi import FastAPI, Request
-from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -24,7 +24,7 @@ import redis.asyncio as redis
 
 # ---------------------- CONFIG ----------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "fxbank-secret")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 BANK_PASSWORD = os.getenv("BANK_PASSWORD", "bank123")
 HOST = "0.0.0.0"
@@ -60,40 +60,48 @@ user_roles: Dict[int, str] = {}  # user_id -> "client" / "bank"
 class NewOrder(StatesGroup):
     choosing_type = State()
     entering_amount = State()
-    entering_currency = State()
+    entering_currency_from = State()
+    entering_currency_to = State()
     entering_rate = State()
-    entering_convert_to = State()
     confirming = State()
 
 # ---------------------- DATA STRUCTURES ----------------------
 class Order:
     counter = 0
 
-    def __init__(self, client_id: int, client_name: str, operation: str,
-                 amount: float, currency: str, rate: float, convert_to: Optional[str] = None):
+    def __init__(
+        self,
+        client_id: int,
+        client_name: str,
+        operation: str,
+        amount: float,
+        currency_from: str,
+        currency_to: Optional[str],
+        rate: float,
+    ):
         Order.counter += 1
         self.id = Order.counter
         self.client_id = client_id
         self.client_name = client_name
         self.operation = operation  # buy, sell, convert
         self.amount = amount
-        self.currency = currency
+        self.currency_from = currency_from
+        self.currency_to = currency_to
         self.rate = rate
-        self.convert_to = convert_to
         self.status = "new"
 
     def summary(self) -> str:
-        text = (
+        if self.operation == "конвертация":
+            op_text = f"{self.amount} {self.currency_from} → {self.currency_to}"
+        else:
+            op_text = f"{self.operation} {self.amount} {self.currency_from}"
+        return (
             f"📌 <b>Заявка #{self.id}</b>\n"
             f"👤 Клиент: {self.client_name}\n"
-            f"💱 Операция: {self.operation}\n"
-            f"💵 Сумма: {self.amount} {self.currency}\n"
+            f"💱 Операция: {op_text}\n"
             f"📊 Курс клиента: {self.rate}\n"
+            f"📍 Статус: {self.status}"
         )
-        if self.operation == "конвертация" and self.convert_to:
-            text += f"➡️ Конвертация в: {self.convert_to}\n"
-        text += f"📍 Статус: {self.status}"
-        return text
 
 # ---------------------- STORAGE ----------------------
 orders: Dict[int, Order] = {}
@@ -126,8 +134,8 @@ def bank_order_kb(order_id: int) -> InlineKeyboardMarkup:
         ]
     ])
 
-# ---------------------- RATES (заглушка) ----------------------
-def get_rates_stub() -> Dict[str, float]:
+# ---------------------- MOCK RATES ----------------------
+def get_mock_rates() -> Dict[str, float]:
     return {
         "USD/UAH": 41.25,
         "EUR/UAH": 45.10,
@@ -136,6 +144,7 @@ def get_rates_stub() -> Dict[str, float]:
         "PLN/USD": 0.2580,
         "EUR/PLN": 4.23,
     }
+
 # ---------------------- HANDLERS ----------------------
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -145,34 +154,32 @@ async def cmd_start(message: Message):
             await message.answer("🏦 Вы вошли как банк.", reply_markup=bank_kb)
         else:
             user_roles[message.from_user.id] = "client"
-            await message.answer(
-                "👋 Добро пожаловать!\nВы вошли как клиент.",
-                reply_markup=client_kb
-            )
+            await message.answer("👋 Добро пожаловать!\nВы вошли как клиент.", reply_markup=client_kb)
     except Exception as e:
         logger.error(f"cmd_start failed: {e}")
 
-@router.message(Command("ping"))
-async def cmd_ping(message: Message):
-    await message.answer("pong")
+@router.message(Command("rate"))
+async def cmd_rate(message: Message):
+    try:
+        rates = get_mock_rates()
+        text = "💱 Текущие курсы:\n" + "\n".join([f"{k} = {v}" for k, v in rates.items()])
+        await message.answer(text)
+    except Exception as e:
+        logger.error(f"cmd_rate failed: {e}")
 
 @router.message(Command("bank"))
 async def cmd_bank(message: Message):
-    parts = message.text.strip().split()
-    if len(parts) < 2:
-        await message.answer("❌ Укажите пароль: /bank <пароль>")
-        return
-    if parts[1] == BANK_PASSWORD:
-        user_roles[message.from_user.id] = "bank"
-        await message.answer("🏦 Успешный вход. Вы вошли как банк.", reply_markup=bank_kb)
-    else:
-        await message.answer("❌ Неверный пароль.")
-
-@router.message(F.text == "💱 Курсы")
-async def show_rates(message: Message):
-    rates = get_rates_stub()
-    text = "💱 Текущие курсы:\n" + "\n".join([f"{k} = {v}" for k, v in rates.items()])
-    await message.answer(text)
+    try:
+        parts = message.text.strip().split()
+        if len(parts) < 2:
+            return await message.answer("❌ Укажите пароль: /bank <пароль>")
+        if parts[1] == BANK_PASSWORD:
+            user_roles[message.from_user.id] = "bank"
+            await message.answer("🏦 Успешный вход. Вы вошли как банк.", reply_markup=bank_kb)
+        else:
+            await message.answer("❌ Неверный пароль.")
+    except Exception as e:
+        logger.error(f"cmd_bank failed: {e}")
 
 # ---------------------- NEW ORDER ----------------------
 @router.message(F.text == "➕ Новая заявка")
@@ -203,26 +210,29 @@ async def enter_amount(message: Message, state: FSMContext):
     except ValueError:
         return await message.answer("❌ Введите число.")
     await state.update_data(amount=amount)
-    await state.set_state(NewOrder.entering_currency)
-    await message.answer("Введите валюту (например USD, EUR):")
+    await state.set_state(NewOrder.entering_currency_from)
+    await message.answer("Введите валюту (например USD, EUR, UAH):")
 
-@router.message(NewOrder.entering_currency)
-async def enter_currency(message: Message, state: FSMContext):
+@router.message(NewOrder.entering_currency_from)
+async def enter_currency_from(message: Message, state: FSMContext):
     data = await state.get_data()
-    if data["operation"] == "конвертация":
-        await state.update_data(currency=message.text.upper())
-        await state.set_state(NewOrder.entering_convert_to)
-        return await message.answer("Введите валюту, в которую хотите конвертировать (например UAH, USD, EUR):")
+    operation = data["operation"]
+    currency_from = message.text.upper()
+    if operation == "конвертация":
+        await state.update_data(currency_from=currency_from)
+        await state.set_state(NewOrder.entering_currency_to)
+        return await message.answer("Введите валюту для получения (например USD, EUR):")
     else:
-        await state.update_data(currency=message.text.upper())
+        await state.update_data(currency_from=currency_from, currency_to="UAH")
         await state.set_state(NewOrder.entering_rate)
         return await message.answer("Введите курс:")
 
-@router.message(NewOrder.entering_convert_to)
-async def enter_convert_to(message: Message, state: FSMContext):
-    await state.update_data(convert_to=message.text.upper())
+@router.message(NewOrder.entering_currency_to)
+async def enter_currency_to(message: Message, state: FSMContext):
+    currency_to = message.text.upper()
+    await state.update_data(currency_to=currency_to)
     await state.set_state(NewOrder.entering_rate)
-    await message.answer("Введите курс конверсии:")
+    await message.answer("Введите курс:")
 
 @router.message(NewOrder.entering_rate)
 async def enter_rate(message: Message, state: FSMContext):
@@ -230,21 +240,21 @@ async def enter_rate(message: Message, state: FSMContext):
         rate = float(message.text.replace(",", "."))
     except ValueError:
         return await message.answer("❌ Введите число.")
-    await state.update_data(rate=rate)
     data = await state.get_data()
     order = Order(
         client_id=message.from_user.id,
         client_name=message.from_user.first_name,
         operation=data["operation"],
         amount=data["amount"],
-        currency=data["currency"],
+        currency_from=data["currency_from"],
+        currency_to=data.get("currency_to"),
         rate=rate,
-        convert_to=data.get("convert_to"),
     )
     orders[order.id] = order
     await state.clear()
     await message.answer(f"✅ Заявка создана:\n{order.summary()}", reply_markup=client_kb)
 
+    # уведомляем банк
     for uid, role in user_roles.items():
         if role == "bank":
             with suppress(Exception):
@@ -288,6 +298,20 @@ async def cb_reject(call: CallbackQuery):
     with suppress(Exception):
         await bot.send_message(o.client_id, f"❌ Ваша заявка #{o.id} отклонена банком.")
 
+@router.callback_query(F.data.startswith("order:"))
+async def cb_order(call: CallbackQuery):
+    if user_roles.get(call.from_user.id) != "bank":
+        return await call.answer("Нет доступа", show_alert=True)
+    oid = int(call.data.split(":")[1])
+    o = orders.get(oid)
+    if not o:
+        return await call.answer("Заявка не найдена", show_alert=True)
+    o.status = "order"
+    await call.message.edit_text(o.summary())
+    await call.answer("Заявка сохранена как ордер 📌")
+    with suppress(Exception):
+        await bot.send_message(o.client_id, f"📌 Ваша заявка #{o.id} сохранена как ордер.")
+
 # ---------------------- FastAPI + Webhook ----------------------
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 
@@ -296,17 +320,24 @@ async def on_startup():
     logger.info("Starting up application...")
     try:
         await redis_conn.ping()
-        logger.info("Redis connection OK")
+        logger.info("Redis connected OK.")
     except Exception as e:
         logger.warning(f"Redis недоступен: {e}")
-    base = os.getenv("WEBHOOK_URL") or f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
-    url = f"{base}{WEBHOOK_PATH}"
-    try:
-        await bot.set_webhook(url, secret_token=WEBHOOK_SECRET,
-                              allowed_updates=["callback_query", "message"])
-        logger.info(f"Webhook set to {url}")
-    except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
+
+    base = os.getenv("WEBHOOK_URL")
+    if not base:
+        host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        if host:
+            base = f"https://{host}"
+    if base:
+        url = f"{base}{WEBHOOK_PATH}"
+        try:
+            await bot.set_webhook(url, secret_token=WEBHOOK_SECRET, allowed_updates=["message", "callback_query"])
+            logger.info(f"Webhook set to {url}")
+        except Exception as e:
+            logger.error(f"Failed to set webhook: {e}")
+    else:
+        logger.warning("WEBHOOK_URL/RENDER_EXTERNAL_HOSTNAME не заданы — вебхук не установлен")
     logger.info("Startup complete.")
 
 @app.on_event("shutdown")
@@ -325,7 +356,7 @@ async def telegram_webhook(request: Request):
 async def health():
     return {"status": "ok", "service": "FXBankBot"}
 
-# ---------------------- Run ----------------------
+# ---------------------- Запуск ----------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host=HOST, port=PORT, reload=False)
