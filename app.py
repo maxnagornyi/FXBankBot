@@ -320,7 +320,6 @@ async def on_startup():
     # корректная инициализация под 3.7
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=storage)
-    dp.include_router(router)
 
     # вычислим URL вебхука
     base = os.getenv("WEBHOOK_URL")
