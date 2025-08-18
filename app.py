@@ -79,7 +79,7 @@ RATES_HASH = "rates"                          # hash ccy->rate
 # -----------------------------
 # FastAPI & Aiogram init
 # -----------------------------
-app = FastAPI(title="FX Bank Bot", version="1.1.1")
+app = FastAPI(title="FX Bank Bot", version="1.1.2")
 
 # Redis connection (Upstash rediss:// ok)
 try:
@@ -195,6 +195,20 @@ def make_confirm_keyboard(ok_cb: str, cancel_cb: str = "common:cancel") -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
+async def safe_answer(callback: CallbackQuery, text: Optional[str] = None, show_alert: bool = False) -> None:
+    """Safely answer callback; ignore 'query is too old' and similar transient errors."""
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except TelegramBadRequest as e:
+        msg = str(e)
+        if "query is too old" in msg or "query ID is invalid" in msg:
+            logger.debug("Ignoring old/invalid callback: %s", msg)
+            return
+        logger.warning("callback.answer bad request: %s", msg)
+    except Exception as e:
+        logger.warning("callback.answer error: %s", e)
+
+
 async def set_commands() -> None:
     if not bot:
         return
@@ -205,7 +219,7 @@ async def set_commands() -> None:
                 BotCommand(command="help", description="Помощь"),
                 BotCommand(command="menu", description="Показать меню"),
                 BotCommand(command="role", description="Сменить роль"),
-                BotCommand(command="bank", description="Вход банка: /bank <пароль>"),
+                BotCommand(command="bank", description="Вход банка: /bank пароль"),
                 BotCommand(command="cancel", description="Отмена действия"),
             ],
             scope=BotCommandScopeDefault(),
@@ -254,7 +268,6 @@ async def set_webhook(force: bool = False) -> None:
         )
         logger.info("Webhook set to %s (allowed_updates=%s)", desired, used_updates)
     except TelegramRetryAfter as e:
-        # Respect Telegram backoff to avoid flood-control
         wait_s = int(getattr(e, "retry_after", 1) or 1)
         logger.warning("Rate limited on set_webhook, sleep %ss then retry once...", wait_s)
         await asyncio.sleep(wait_s)
@@ -280,7 +293,6 @@ async def watchdog_task():
     logger.info("Watchdog enabled (interval=%ss).", WATCHDOG_INTERVAL)
     while True:
         try:
-            # only enforce if url mismatched
             desired = await _desired_webhook_url()
             if not desired:
                 await asyncio.sleep(WATCHDOG_INTERVAL)
@@ -308,7 +320,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(
             f"Привет, {hbold(message.from_user.full_name)}!\n"
             f"Этот бот помогает клиентам и банкам обмениваться заявками по валютному рынку.\n\n"
-            f"Выберите роль или введите /bank <пароль> для входа банка:",
+            f"Выберите роль или введите команду: /bank пароль — для входа банка.",
             reply_markup=make_role_keyboard(),
         )
     except Exception as e:
@@ -324,7 +336,7 @@ async def cmd_help(message: Message):
             "/start — запустить бота и выбрать роль\n"
             "/menu — показать актуальное меню\n"
             "/role — сменить роль (клиент/банк)\n"
-            "/bank <пароль> — вход для банка\n"
+            "/bank пароль — вход для банка\n"
             "/cancel — отменить текущее действие\n\n"
             "Поддерживаемые валюты: " + ", ".join(SUPPORTED_CCY)
         )
@@ -378,10 +390,9 @@ async def cq_help(callback: CallbackQuery):
             "Команды доступны через меню.",
             reply_markup=make_role_keyboard(),
         )
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_help failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 @common_router.callback_query(F.data == "role:choose")
@@ -389,10 +400,9 @@ async def cq_role_choose(callback: CallbackQuery, state: FSMContext):
     try:
         await state.clear()
         await callback.message.edit_text("Выберите роль:", reply_markup=make_role_keyboard())
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_role_choose failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 @common_router.callback_query(F.data.startswith("role:"))
@@ -400,22 +410,20 @@ async def cq_role_set(callback: CallbackQuery):
     try:
         role = callback.data.split(":", 1)[1]
         if role not in ("client", "bank"):
-            await callback.answer("Неизвестная роль.", show_alert=True)
+            await safe_answer(callback, "Неизвестная роль.", show_alert=True)
             return
-        # Для роли банк — дополнительная подсказка про /bank <пароль>
         await set_role(callback.from_user.id, role if role == "client" else "bank")
         if role == "bank":
             await callback.message.edit_text(
                 "Роль установлена: 🏦 Банк.\n"
-                "Если ещё не вводили пароль, выполните команду: /bank <пароль>\nВыберите действие:",
+                "Если ещё не вводили пароль, выполните команду: /bank пароль\nВыберите действие:",
                 reply_markup=make_bank_menu(),
             )
         else:
             await callback.message.edit_text("Роль установлена: 👤 Клиент.\nВыберите действие:", reply_markup=make_client_menu())
-        await callback.answer("Роль изменена.")
+        await safe_answer(callback, "Роль изменена.")
     except Exception as e:
         logger.exception("cq_role_set failed: %s", e)
-        await callback.answer("Не удалось установить роль.", show_alert=True)
 
 
 @common_router.callback_query(F.data == "common:rates")
@@ -435,10 +443,9 @@ async def cq_show_rates(callback: CallbackQuery):
             txt,
             reply_markup=(make_bank_menu() if await get_role(callback.from_user.id) == "bank" else make_client_menu()),
         )
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_show_rates failed: %s", e)
-        await callback.answer("Ошибка при получении курсов.", show_alert=True)
 
 
 @common_router.callback_query(F.data == "common:cancel")
@@ -448,10 +455,9 @@ async def cq_common_cancel(callback: CallbackQuery, state: FSMContext):
         role = await get_role(callback.from_user.id)
         kb = make_bank_menu() if role == "bank" else make_client_menu()
         await callback.message.edit_text("Отменено. Возврат в меню.", reply_markup=kb)
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_common_cancel failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 @common_router.callback_query(F.data == "common:back")
@@ -461,10 +467,9 @@ async def cq_common_back(callback: CallbackQuery, state: FSMContext):
         role = await get_role(callback.from_user.id)
         kb = make_bank_menu() if role == "bank" else make_client_menu()
         await callback.message.edit_text("Назад в меню.", reply_markup=kb)
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_common_back failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 # -----------------------------
@@ -475,7 +480,7 @@ async def cmd_bank(message: Message):
     try:
         parts = (message.text or "").strip().split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("❌ Укажите пароль: /bank <пароль>")
+            await message.answer("❌ Укажите пароль: /bank пароль")
             return
         if parts[1] == BANK_PASSWORD:
             await set_role(message.from_user.id, "bank")
@@ -499,10 +504,9 @@ async def cq_client_buy(callback: CallbackQuery, state: FSMContext):
             "🟢 Покупка валюты.\nВведите сумму (например, 1000.50):",
             reply_markup=make_confirm_keyboard(ok_cb="noop", cancel_cb="common:cancel"),
         )
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_client_buy failed: %s", e)
-        await callback.answer("Ошибка при начале заявки.", show_alert=True)
 
 
 @client_router.callback_query(F.data == "client:sell")
@@ -514,10 +518,9 @@ async def cq_client_sell(callback: CallbackQuery, state: FSMContext):
             "🔵 Продажа валюты.\nВведите сумму (например, 500):",
             reply_markup=make_confirm_keyboard(ok_cb="noop", cancel_cb="common:cancel"),
         )
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_client_sell failed: %s", e)
-        await callback.answer("Ошибка при начале заявки.", show_alert=True)
 
 
 @client_router.message(ClientOrderSG.enter_amount)
@@ -545,7 +548,7 @@ async def cq_client_choose_currency(callback: CallbackQuery, state: FSMContext):
     try:
         ccy = callback.data.split(":", 1)[1]
         if ccy not in SUPPORTED_CCY:
-            await callback.answer("Неподдерживаемая валюта.", show_alert=True)
+            await safe_answer(callback, "Неподдерживаемая валюта.", show_alert=True)
             return
         data = await state.get_data()
         action = data.get("action", "buy")
@@ -573,10 +576,9 @@ async def cq_client_choose_currency(callback: CallbackQuery, state: FSMContext):
             "Проверьте заявку:\n" + "\n".join(summary_lines),
             reply_markup=make_confirm_keyboard(ok_cb="client:confirm", cancel_cb="common:cancel"),
         )
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_client_choose_currency failed: %s", e)
-        await callback.answer("Ошибка при выборе валюты.", show_alert=True)
 
 
 @client_router.callback_query(ClientOrderSG.confirm, F.data == "client:confirm")
@@ -587,7 +589,7 @@ async def cq_client_confirm(callback: CallbackQuery, state: FSMContext):
         amount = data.get("amount")
         currency = data.get("currency")
         if not all([action, amount, currency]):
-            await callback.answer("Данные заявки неполные. Начните заново.", show_alert=True)
+            await safe_answer(callback, "Данные заявки неполные. Начните заново.", show_alert=True)
             await state.clear()
             return
 
@@ -613,7 +615,7 @@ async def cq_client_confirm(callback: CallbackQuery, state: FSMContext):
             await pipe.execute()
         except Exception as re:
             logger.exception("Failed to save order: %s", re)
-            await callback.answer("Не удалось сохранить заявку (ошибка БД).", show_alert=True)
+            await safe_answer(callback, "Не удалось сохранить заявку (ошибка БД).", show_alert=True)
             return
 
         await state.clear()
@@ -625,10 +627,9 @@ async def cq_client_confirm(callback: CallbackQuery, state: FSMContext):
             "Ожидайте ответа банка.",
             reply_markup=make_client_menu(),
         )
-        await callback.answer("Создано.")
+        await safe_answer(callback, "Создано.")
     except Exception as e:
         logger.exception("cq_client_confirm failed: %s", e)
-        await callback.answer("Ошибка при подтверждении заявки.", show_alert=True)
 
 
 @client_router.callback_query(F.data == "client:orders")
@@ -642,7 +643,7 @@ async def cq_client_orders(callback: CallbackQuery):
 
         if not order_ids:
             await callback.message.edit_text("У вас пока нет заявок.", reply_markup=make_client_menu())
-            await callback.answer()
+            await safe_answer(callback)
             return
 
         orders: List[Dict[str, Any]] = []
@@ -661,10 +662,9 @@ async def cq_client_orders(callback: CallbackQuery):
                 f"• {hcode(o['order_id'])}: {o['action']} {o['amount']} {o['currency']} — {hbold(o['status'])}"
             )
         await callback.message.edit_text("Ваши последние заявки:\n" + "\n".join(lines), reply_markup=make_client_menu())
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_client_orders failed: %s", e)
-        await callback.answer("Ошибка при получении заявок.", show_alert=True)
 
 
 # -----------------------------
@@ -674,14 +674,13 @@ async def cq_client_orders(callback: CallbackQuery):
 async def cq_bank_set_rate(callback: CallbackQuery, state: FSMContext):
     try:
         if await get_role(callback.from_user.id) != "bank":
-            await callback.answer("Эта функция доступна роли 'банк'.", show_alert=True)
+            await safe_answer(callback, "Эта функция доступна роли 'банк'.", show_alert=True)
             return
         await state.set_state(BankSetRateSG.choose_currency)
         await callback.message.edit_text("Выберите валюту для установки курса:", reply_markup=make_currency_keyboard())
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_bank_set_rate failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 @bank_router.callback_query(BankSetRateSG.choose_currency, F.data.startswith("ccy:"))
@@ -689,7 +688,7 @@ async def cq_bank_choose_currency(callback: CallbackQuery, state: FSMContext):
     try:
         ccy = callback.data.split(":", 1)[1]
         if ccy not in SUPPORTED_CCY:
-            await callback.answer("Неподдерживаемая валюта.", show_alert=True)
+            await safe_answer(callback, "Неподдерживаемая валюта.", show_alert=True)
             return
         await state.update_data(currency=ccy)
         await state.set_state(BankSetRateSG.enter_rate)
@@ -697,10 +696,9 @@ async def cq_bank_choose_currency(callback: CallbackQuery, state: FSMContext):
             f"Валюта: {hcode(ccy)}\nВведите курс (число):",
             reply_markup=make_confirm_keyboard(ok_cb="noop", cancel_cb="common:cancel"),
         )
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_bank_choose_currency failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 @bank_router.message(BankSetRateSG.enter_rate)
@@ -729,35 +727,34 @@ async def msg_bank_enter_rate(message: Message, state: FSMContext):
 async def cq_bank_rate_confirm(callback: CallbackQuery, state: FSMContext):
     try:
         if await get_role(callback.from_user.id) != "bank":
-            await callback.answer("Доступ запрещён (только для банка).", show_alert=True)
+            await safe_answer(callback, "Доступ запрещён (только для банка).", show_alert=True)
             return
         data = await state.get_data()
         ccy = data.get("currency")
         rate = data.get("rate")
         if not (ccy and rate):
-            await callback.answer("Данные неполные.", show_alert=True)
+            await safe_answer(callback, "Данные неполные.", show_alert=True)
             return
         try:
             await redis.hset(RATES_HASH, ccy, str(rate))  # type: ignore
         except Exception as re:
             logger.exception("Failed to set rate in Redis: %s", re)
-            await callback.answer("Ошибка сохранения курса.", show_alert=True)
+            await safe_answer(callback, "Ошибка сохранения курса.", show_alert=True)
             return
         await state.clear()
         await callback.message.edit_text(
             f"✅ Курс обновлён: {hcode(ccy)} = {hcode(rate)}", reply_markup=make_bank_menu()
         )
-        await callback.answer("Сохранено.")
+        await safe_answer(callback, "Сохранено.")
     except Exception as e:
         logger.exception("cq_bank_rate_confirm failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 @bank_router.callback_query(F.data == "bank:orders")
 async def cq_bank_orders(callback: CallbackQuery):
     try:
         if await get_role(callback.from_user.id) != "bank":
-            await callback.answer("Доступ запрещён (только для банка).", show_alert=True)
+            await safe_answer(callback, "Доступ запрещён (только для банка).", show_alert=True)
             return
         try:
             order_ids = await redis.smembers(PENDING_ORDERS_SET)  # type: ignore
@@ -767,7 +764,7 @@ async def cq_bank_orders(callback: CallbackQuery):
 
         if not order_ids:
             await callback.message.edit_text("Пока нет заявок в статусе pending.", reply_markup=make_bank_menu())
-            await callback.answer()
+            await safe_answer(callback)
             return
 
         orders: List[Dict[str, Any]] = []
@@ -782,7 +779,7 @@ async def cq_bank_orders(callback: CallbackQuery):
 
         if not orders:
             await callback.message.edit_text("Не удалось загрузить заявки.", reply_markup=make_bank_menu())
-            await callback.answer()
+            await safe_answer(callback)
             return
 
         lines = []
@@ -804,24 +801,23 @@ async def cq_bank_orders(callback: CallbackQuery):
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
         await callback.message.edit_text("Заявки pending:\n" + "\n".join(lines), reply_markup=kb)
-        await callback.answer()
+        await safe_answer(callback)
     except Exception as e:
         logger.exception("cq_bank_orders failed: %s", e)
-        await callback.answer("Ошибка при получении заявок.", show_alert=True)
 
 
 @bank_router.callback_query(F.data.startswith("bank:accept:"))
 async def cq_bank_accept(callback: CallbackQuery):
     try:
         if await get_role(callback.from_user.id) != "bank":
-            await callback.answer("Доступ запрещён.", show_alert=True)
+            await safe_answer(callback, "Доступ запрещён.", show_alert=True)
             return
         order_id = callback.data.split(":", 2)[2]
         user_id_str = order_id.split("-", 1)[0]
         key = ORDER_KEY.format(user_id=user_id_str, order_id=order_id)
         raw = await redis.get(key)  # type: ignore
         if not raw:
-            await callback.answer("Заявка не найдена.", show_alert=True)
+            await safe_answer(callback, "Заявка не найдена.", show_alert=True)
             return
         order = json.loads(raw)
         order["status"] = "accepted"
@@ -832,7 +828,7 @@ async def cq_bank_accept(callback: CallbackQuery):
         pipe.srem(PENDING_ORDERS_SET, order_id)
         await pipe.execute()
 
-        await callback.answer("Заявка принята.")
+        await safe_answer(callback, "Заявка принята.")
         try:
             if bot:
                 text = (
@@ -846,21 +842,20 @@ async def cq_bank_accept(callback: CallbackQuery):
         await cq_bank_orders(callback)
     except Exception as e:
         logger.exception("cq_bank_accept failed: %s", e)
-        await callback.answer("Ошибка при принятии заявки.", show_alert=True)
 
 
 @bank_router.callback_query(F.data.startswith("bank:reject:"))
 async def cq_bank_reject(callback: CallbackQuery):
     try:
         if await get_role(callback.from_user.id) != "bank":
-            await callback.answer("Доступ запрещён.", show_alert=True)
+            await safe_answer(callback, "Доступ запрещён.", show_alert=True)
             return
         order_id = callback.data.split(":", 2)[2]
         user_id_str = order_id.split("-", 1)[0]
         key = ORDER_KEY.format(user_id=user_id_str, order_id=order_id)
         raw = await redis.get(key)  # type: ignore
         if not raw:
-            await callback.answer("Заявка не найдена.", show_alert=True)
+            await safe_answer(callback, "Заявка не найдена.", show_alert=True)
             return
         order = json.loads(raw)
         order["status"] = "rejected"
@@ -871,7 +866,7 @@ async def cq_bank_reject(callback: CallbackQuery):
         pipe.srem(PENDING_ORDERS_SET, order_id)
         await pipe.execute()
 
-        await callback.answer("Заявка отклонена.")
+        await safe_answer(callback, "Заявка отклонена.")
         try:
             if bot:
                 text = (
@@ -885,14 +880,13 @@ async def cq_bank_reject(callback: CallbackQuery):
         await cq_bank_orders(callback)
     except Exception as e:
         logger.exception("cq_bank_reject failed: %s", e)
-        await callback.answer("Ошибка при отклонении заявки.", show_alert=True)
 
 
 @bank_router.callback_query(F.data == "bank:clear_orders")
 async def cq_bank_clear_orders(callback: CallbackQuery):
     try:
         if await get_role(callback.from_user.id) != "bank":
-            await callback.answer("Доступ запрещён.", show_alert=True)
+            await safe_answer(callback, "Доступ запрещён.", show_alert=True)
             return
         try:
             pending = await redis.smembers(PENDING_ORDERS_SET)  # type: ignore
@@ -901,10 +895,9 @@ async def cq_bank_clear_orders(callback: CallbackQuery):
         except Exception as re:
             logger.error("Failed to clear pending set: %s", re)
         await callback.message.edit_text("Очередь pending очищена.", reply_markup=make_bank_menu())
-        await callback.answer("Готово.")
+        await safe_answer(callback, "Готово.")
     except Exception as e:
         logger.exception("cq_bank_clear_orders failed: %s", e)
-        await callback.answer("Ошибка.", show_alert=True)
 
 
 # -----------------------------
@@ -998,7 +991,7 @@ async def on_startup():
     try:
         logger.info("Starting up application...")
         await set_commands()
-        await set_webhook()  # now idempotent
+        await set_webhook()  # idempotent
         if ENABLE_WATCHDOG:
             asyncio.create_task(watchdog_task())
         logger.info("Startup complete.")
