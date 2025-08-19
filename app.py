@@ -3,8 +3,9 @@ import asyncio
 import logging
 from typing import Dict, Optional
 from contextlib import suppress
-import redis.asyncio as redis
 
+import redis.asyncio as redis
+import aiohttp
 from fastapi import FastAPI, Request
 
 from aiogram import Bot, Dispatcher, Router, F, types
@@ -24,6 +25,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 
 # ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -36,14 +38,17 @@ WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
-# Render: предпочитаем явный WEBHOOK_URL, иначе RENDER_EXTERNAL_HOSTNAME
+# URL сервиса
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or (
     f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
     if os.getenv("RENDER_EXTERNAL_HOSTNAME")
     else "https://fxbankbot.onrender.com"
 )
 
+# Watchdog и self-ping
 WATCHDOG_INTERVAL = int(os.getenv("WEBHOOK_WATCHDOG_INTERVAL", "60"))  # сек
+SELF_PING_ENABLE = os.getenv("SELF_PING_ENABLE", "false").lower() == "true"
+SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", "240"))  # сек
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -53,11 +58,9 @@ logging.basicConfig(
 logger = logging.getLogger("fxbank_bot")
 
 # ===================== FASTAPI =====================
-app = FastAPI(title="FXBankBot", version="1.8.0")
+app = FastAPI(title="FXBankBot", version="1.9.0")
 
 # ===================== REDIS (FSM) =====================
-redis_conn: Optional[redis.Redis] = None
-storage: Optional[RedisStorage] = None
 try:
     redis_conn = redis.from_url(REDIS_URL)
     storage = RedisStorage(redis_conn)
@@ -74,6 +77,24 @@ bot = Bot(
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
+
+# ===================== MIDDLEWARE: лог каждого апдейта =====================
+class LoggingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        try:
+            if isinstance(event, types.Message):
+                logger.info(f"MSG from {event.from_user.id} @{event.from_user.username}: "
+                            f"text={repr(event.text)} state={await data['state'].get_state() if 'state' in data else None}")
+            elif isinstance(event, types.CallbackQuery):
+                logger.info(f"CB from {event.from_user.id} @{event.from_user.username}: "
+                            f"data={repr(event.data)}")
+            else:
+                logger.info(f"UPDATE type={type(event)} received.")
+        except Exception as e:
+            logger.warning(f"LoggingMiddleware error: {e}")
+        return await handler(event, data)
+
+dp.update.outer_middleware(LoggingMiddleware())
 
 # ===================== RUNTIME STORAGE =====================
 user_roles: Dict[int, str] = {}  # user_id -> "client" | "bank"
@@ -180,7 +201,7 @@ def ikb_bank_order(order_id: int) -> InlineKeyboardMarkup:
 
 # ===================== RATES (STUB) =====================
 def get_stub_rates() -> Dict[str, float]:
-    # Позже подключим поставщика (LSEG/BBG)
+    # Позже подключим поставщика (LSEG/Bloomberg)
     return {
         "USD/UAH": 41.25,
         "EUR/UAH": 45.10,
@@ -509,15 +530,13 @@ async def cq_order(callback: CallbackQuery):
         logger.error(f"cq_order failed: {e}")
         await safe_cb_answer(callback, "⚠️ Ошибка", show_alert=True)
 
-# ===================== WEBHOOK MGMT =====================
+# ===================== WEBHOOK MGMT + WATCHDOG + SELF-PING =====================
 _watchdog_task: Optional[asyncio.Task] = None
+_self_ping_task: Optional[asyncio.Task] = None
 
 async def set_webhook_safely(url: str):
-    """
-    Ставит вебхук с защитой от Flood Control и подробным логом.
-    """
+    """Ставит вебхук с защитой от Flood Control и подробным логом."""
     try:
-        # предварительно чистим (без ожидания неупавших апдейтов)
         with suppress(Exception):
             await bot.delete_webhook(drop_pending_updates=True)
 
@@ -531,7 +550,6 @@ async def set_webhook_safely(url: str):
         delay = max(int(e.retry_after), 1)
         logger.warning(f"Flood control on set_webhook. Retry after {delay}s")
         await asyncio.sleep(delay)
-        # повтор
         await bot.set_webhook(
             url,
             secret_token=WEBHOOK_SECRET,
@@ -546,10 +564,7 @@ async def set_webhook_safely(url: str):
         raise
 
 async def webhook_watchdog():
-    """
-    Каждые WATCHDOG_INTERVAL секунд проверяет, что вебхук соответствует {WEBHOOK_BASE}{WEBHOOK_PATH}.
-    Если нет — переустанавливает.
-    """
+    """Каждые WATCHDOG_INTERVAL сек проверяет URL вебхука, при расхождении — переустанавливает."""
     desired = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
     while True:
         try:
@@ -560,28 +575,59 @@ async def webhook_watchdog():
                 with suppress(Exception):
                     await set_webhook_safely(desired)
             else:
-                # можно ещё проверять ip_address / allowed_updates при желании
                 logger.info("Watchdog: webhook OK.")
         except Exception as e:
             logger.error(f"Watchdog error: {e}")
         await asyncio.sleep(WATCHDOG_INTERVAL)
 
+async def self_ping_loop():
+    """Опциональный self-ping, чтобы Render не усыплял сервис (лучше держать включённым для Free-плана)."""
+    if not SELF_PING_ENABLE:
+        return
+    url = f"{WEBHOOK_BASE}/"
+    session_timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=session_timeout) as session:
+        while True:
+            try:
+                async with session.get(url) as resp:
+                    logger.info(f"Self-ping {url} -> {resp.status}")
+            except Exception as e:
+                logger.warning(f"Self-ping error: {e}")
+            await asyncio.sleep(SELF_PING_INTERVAL)
+
 # ===================== FASTAPI ROUTES =====================
 @app.on_event("startup")
 async def on_startup():
     try:
-        # Проверка Redis соединения, чтобы не подвисало FSM
+        # Команды бота (подсказки в интерфейсе Telegram)
+        with suppress(Exception):
+            await bot.set_my_commands([
+                types.BotCommand(command="start", description="Запуск / выбор роли"),
+                types.BotCommand(command="menu", description="Главное меню"),
+                types.BotCommand(command="rate", description="Показать курсы"),
+                types.BotCommand(command="cancel", description="Отмена текущего действия"),
+                types.BotCommand(command="bank", description="Вход роли банк: /bank <пароль>"),
+            ])
+
+        # Проверка Redis
         with suppress(Exception):
             pong = await redis_conn.ping()
             if pong:
                 logger.info("Redis connected OK.")
 
+        # Вебхук
         desired = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
         await set_webhook_safely(desired)
 
-        # Стартуем watchdog
+        # Старт watchdog
         global _watchdog_task
         _watchdog_task = asyncio.create_task(webhook_watchdog())
+
+        # Старт self-ping (если включён)
+        global _self_ping_task
+        if SELF_PING_ENABLE:
+            _self_ping_task = asyncio.create_task(self_ping_loop())
+
         logger.info(f"Startup complete. Watchdog enabled (interval={WATCHDOG_INTERVAL}s).")
     except Exception as e:
         logger.error(f"Startup failed: {e}")
@@ -592,6 +638,9 @@ async def on_shutdown():
         if _watchdog_task:
             _watchdog_task.cancel()
     with suppress(Exception):
+        if _self_ping_task:
+            _self_ping_task.cancel()
+    with suppress(Exception):
         await redis_conn.close()
     with suppress(Exception):
         await bot.session.close()
@@ -599,14 +648,19 @@ async def on_shutdown():
 
 @app.get("/")
 async def index():
-    return {"status": "ok", "bot": "FXBankBot", "webhook": f"{WEBHOOK_BASE}{WEBHOOK_PATH}"}
+    return {
+        "status": "ok",
+        "bot": "FXBankBot",
+        "webhook": f"{WEBHOOK_BASE}{WEBHOOK_PATH}",
+        "self_ping": SELF_PING_ENABLE,
+    }
 
 @app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
     try:
         raw = await request.body()
         update = types.Update.model_validate_json(raw)
-        # ВАЖНО: секрет передаём именованным аргументом, иначе третий аргумент — это timeout (int)
+        # ВАЖНО: секрет передаём именованным аргументом, иначе третий позиционный — timeout (int)
         await dp.feed_webhook_update(bot, update, secret_token=WEBHOOK_SECRET)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
