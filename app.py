@@ -58,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger("fxbank_bot")
 
 # ===================== FASTAPI =====================
-app = FastAPI(title="FXBankBot", version="2.0.0")
+app = FastAPI(title="FXBankBot", version="2.0.1")
 
 # ===================== REDIS (FSM) =====================
 try:
@@ -78,9 +78,23 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# ===================== MIDDLEWARE: лог каждого апдейта =====================
-class LoggingMiddleware(BaseMiddleware):
+# ===================== MIDDLEWARE: подробные логи =====================
+class UpdateLoggingMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        # Это middleware на уровне Update
+        try:
+            # event тут — aiogram.types.Update
+            raw = ""
+            with suppress(Exception):
+                raw = event.model_dump_json()[:600]
+            logger.info(f"RAW UPDATE: {raw}")
+        except Exception as e:
+            logger.warning(f"UpdateLoggingMiddleware error: {e}")
+        return await handler(event, data)
+
+class EventLoggingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        # Это middleware для message/callback уровней
         try:
             if isinstance(event, types.Message):
                 state = None
@@ -95,13 +109,14 @@ class LoggingMiddleware(BaseMiddleware):
                 logger.info(
                     f"CB from {event.from_user.id} @{event.from_user.username}: data={repr(event.data)}"
                 )
-            else:
-                logger.info(f"UPDATE type={type(event)} received.")
         except Exception as e:
-            logger.warning(f"LoggingMiddleware error: {e}")
+            logger.warning(f"EventLoggingMiddleware error: {e}")
         return await handler(event, data)
 
-dp.update.outer_middleware(LoggingMiddleware())
+# Вешаем логирование и на Update, и на конкретные типы событий
+dp.update.outer_middleware(UpdateLoggingMiddleware())
+dp.message.outer_middleware(EventLoggingMiddleware())
+dp.callback_query.outer_middleware(EventLoggingMiddleware())
 
 # ===================== RUNTIME STORAGE =====================
 user_roles: Dict[int, str] = {}  # user_id -> "client" | "bank"
@@ -568,8 +583,9 @@ _self_ping_task: Optional[asyncio.Task] = None
 async def set_webhook_safely(url: str):
     """Ставит вебхук с защитой от Flood Control и подробным логом."""
     try:
+        # ВАЖНО: не дропаем накопленные апдейты
         with suppress(Exception):
-            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.delete_webhook()
 
         await bot.set_webhook(
             url,
