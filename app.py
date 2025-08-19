@@ -58,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger("fxbank_bot")
 
 # ===================== FASTAPI =====================
-app = FastAPI(title="FXBankBot", version="1.9.0")
+app = FastAPI(title="FXBankBot", version="2.0.0")
 
 # ===================== REDIS (FSM) =====================
 try:
@@ -83,11 +83,18 @@ class LoggingMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         try:
             if isinstance(event, types.Message):
-                logger.info(f"MSG from {event.from_user.id} @{event.from_user.username}: "
-                            f"text={repr(event.text)} state={await data['state'].get_state() if 'state' in data else None}")
+                state = None
+                if "state" in data:
+                    with suppress(Exception):
+                        state = await data["state"].get_state()
+                logger.info(
+                    f"MSG from {event.from_user.id} @{event.from_user.username}: "
+                    f"text={repr(event.text)} state={state}"
+                )
             elif isinstance(event, types.CallbackQuery):
-                logger.info(f"CB from {event.from_user.id} @{event.from_user.username}: "
-                            f"data={repr(event.data)}")
+                logger.info(
+                    f"CB from {event.from_user.id} @{event.from_user.username}: data={repr(event.data)}"
+                )
             else:
                 logger.info(f"UPDATE type={type(event)} received.")
         except Exception as e:
@@ -153,7 +160,7 @@ def kb_main_client() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Новая заявка")],
-            [KeyboardButton(text="💱 Курсы")],
+            [KeyboardButton(text="🗂 Мои заявки"), KeyboardButton(text="💱 Курсы")],
         ],
         resize_keyboard=True,
     )
@@ -468,6 +475,24 @@ async def fsm_rate(message: Message, state: FSMContext):
         logger.error(f"fsm_rate failed: {e}")
         await message.answer("⚠️ Ошибка при вводе курса.")
 
+# ===================== CLIENT: /mytrades =====================
+@router.message(Command("mytrades"))
+@router.message(F.text == "🗂 Мои заявки")
+async def my_trades(message: Message):
+    try:
+        user_id = message.from_user.id
+        user_orders = [o for o in orders.values() if o.client_id == user_id]
+        if not user_orders:
+            return await message.answer("📭 У вас пока нет заявок.", reply_markup=kb_main_client())
+        chunks = []
+        for o in sorted(user_orders, key=lambda x: x.id, reverse=True):
+            chunks.append(o.summary())
+        text = "\n\n".join(chunks)
+        await message.answer("🗂 Ваши заявки:\n\n" + text, reply_markup=kb_main_client())
+    except Exception as e:
+        logger.error(f"/mytrades failed: {e}")
+        await message.answer("⚠️ Не удалось показать ваши заявки.")
+
 # ===================== BANK FLOW =====================
 @router.message(F.text == "📋 Все заявки")
 async def bank_orders(message: Message):
@@ -493,6 +518,7 @@ async def cq_accept(callback: CallbackQuery):
         await callback.message.edit_text(order.summary())
         await safe_cb_answer(callback, "✅ Заявка принята")
 
+        # уведомим клиента
         with suppress(Exception):
             await bot.send_message(order.client_id, f"✅ Ваша заявка #{oid} принята банком.")
     except Exception as e:
@@ -510,6 +536,7 @@ async def cq_reject(callback: CallbackQuery):
         await callback.message.edit_text(order.summary())
         await safe_cb_answer(callback, "❌ Заявка отклонена")
 
+        # уведомим клиента
         with suppress(Exception):
             await bot.send_message(order.client_id, f"❌ Ваша заявка #{oid} отклонена банком.")
     except Exception as e:
@@ -526,6 +553,10 @@ async def cq_order(callback: CallbackQuery):
         order.status = "order"
         await callback.message.edit_text(order.summary())
         await safe_cb_answer(callback, "📌 Сохранено как ордер")
+
+        # уведомим клиента
+        with suppress(Exception):
+            await bot.send_message(order.client_id, f"📌 Ваша заявка #{oid} принята банком как ордер.")
     except Exception as e:
         logger.error(f"cq_order failed: {e}")
         await safe_cb_answer(callback, "⚠️ Ошибка", show_alert=True)
@@ -581,7 +612,7 @@ async def webhook_watchdog():
         await asyncio.sleep(WATCHDOG_INTERVAL)
 
 async def self_ping_loop():
-    """Опциональный self-ping, чтобы Render не усыплял сервис (лучше держать включённым для Free-плана)."""
+    """Опциональный self-ping, чтобы Render не усыплял сервис (полезно на Free-плане)."""
     if not SELF_PING_ENABLE:
         return
     url = f"{WEBHOOK_BASE}/"
@@ -605,6 +636,7 @@ async def on_startup():
                 types.BotCommand(command="start", description="Запуск / выбор роли"),
                 types.BotCommand(command="menu", description="Главное меню"),
                 types.BotCommand(command="rate", description="Показать курсы"),
+                types.BotCommand(command="mytrades", description="Показать мои заявки"),
                 types.BotCommand(command="cancel", description="Отмена текущего действия"),
                 types.BotCommand(command="bank", description="Вход роли банк: /bank <пароль>"),
             ])
